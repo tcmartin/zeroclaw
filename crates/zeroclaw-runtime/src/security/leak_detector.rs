@@ -321,10 +321,14 @@ impl LeakDetector {
         });
         let content_stripped = url_re.replace_all(content, "");
         let content_without_urls = media_re.replace_all(&content_stripped, "");
+        let lowercase_content = content_without_urls.to_ascii_lowercase();
 
         let tokens = extract_candidate_tokens(&content_without_urls);
 
         for token in tokens {
+            if is_probable_file_or_path_token(token, &lowercase_content) {
+                continue;
+            }
             if token.len() >= ENTROPY_TOKEN_MIN_LEN {
                 let entropy = shannon_entropy(token);
                 if entropy >= entropy_threshold && has_mixed_alpha_digit(token) {
@@ -366,6 +370,24 @@ fn has_mixed_alpha_digit(s: &str) -> bool {
     let has_alpha = s.bytes().any(|b| b.is_ascii_alphabetic());
     let has_digit = s.bytes().any(|b| b.is_ascii_digit());
     has_alpha && has_digit
+}
+
+fn is_probable_file_or_path_token(token: &str, lowercase_content: &str) -> bool {
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    token_matches_known_file_extension(token, lowercase_content)
+}
+
+fn token_matches_known_file_extension(token: &str, lowercase_content: &str) -> bool {
+    const KNOWN_EXTENSIONS: [&str; 10] = [
+        ".xlsx", ".xls", ".csv", ".tsv", ".ods", ".numbers", ".pdf", ".txt", ".md", ".json",
+    ];
+    let token_lower = token.to_ascii_lowercase();
+    KNOWN_EXTENSIONS.iter().any(|ext| {
+        let needle = format!("{token_lower}{ext}");
+        lowercase_content.contains(&needle)
+    })
 }
 
 #[cfg(test)]
@@ -572,6 +594,28 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 panic!("Should still detect high-entropy tokens outside media markers")
             }
         }
+    }
+
+    #[test]
+    fn spreadsheet_filename_not_redacted_as_high_entropy() {
+        let detector = LeakDetector::new();
+        let content = "Uploaded workbook: Q3Plan_aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG.xlsx";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Spreadsheet filenames should not be redacted as high-entropy tokens"
+        );
+    }
+
+    #[test]
+    fn local_file_path_not_redacted_as_high_entropy() {
+        let detector = LeakDetector::new();
+        let content = "Saved file at /tmp/Q3Plan_aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG.xlsx";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Local file paths should not be redacted as high-entropy tokens"
+        );
     }
 
     #[test]

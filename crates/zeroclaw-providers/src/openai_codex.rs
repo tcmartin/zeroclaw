@@ -1134,6 +1134,7 @@ data: [DONE]
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_api_keys: std::collections::HashMap::new(),
             merge_system_into_user: false,
         };
         let provider =

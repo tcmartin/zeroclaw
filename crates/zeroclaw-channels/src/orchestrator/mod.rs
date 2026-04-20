@@ -3027,50 +3027,59 @@ async fn process_channel_message(
         let llm_result = loop {
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = tokio::time::timeout(
-                    Duration::from_secs(timeout_budget_secs),
-                    scope_thread_id(
+                result = async {
+                    let tool_loop_future = scope_thread_id(
                         msg.interruption_scope_id.clone()
                             .or_else(|| msg.thread_ts.clone())
                             .or_else(|| Some(msg.id.clone())),
                         zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                        active_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                        target_channel.as_deref(),
-                    ),
-                    ),
-                    ),
-                ) => LlmExecutionResult::Completed(result),
+                            run_tool_call_loop(
+                                active_provider.as_ref(),
+                                &mut history,
+                                ctx.tools_registry.as_ref(),
+                                notify_observer.as_ref() as &dyn Observer,
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                Some(&*ctx.approval_manager),
+                                msg.channel.as_str(),
+                                Some(msg.reply_target.as_str()),
+                                &ctx.multimodal,
+                                ctx.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx.clone(),
+                                ctx.hooks.as_deref(),
+                                if msg.channel == "cli"
+                                    || ctx.autonomy_level == AutonomyLevel::Full
+                                {
+                                    &[]
+                                } else {
+                                    ctx.non_cli_excluded_tools.as_ref()
+                                },
+                                ctx.tool_call_dedup_exempt.as_ref(),
+                                ctx.activated_tools.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &ctx.pacing,
+                                ctx.max_tool_result_chars,
+                                ctx.context_token_budget,
+                                None, // shared_budget
+                                target_channel.as_deref(),
+                            ),
+                        ),
+                    );
+
+                    if ctx.autonomy_level == AutonomyLevel::Full {
+                        Ok(tool_loop_future.await)
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(timeout_budget_secs),
+                            tool_loop_future,
+                        )
+                        .await
+                    }
+                } => LlmExecutionResult::Completed(result),
             };
 
             // Handle model switch: re-create the provider and retry

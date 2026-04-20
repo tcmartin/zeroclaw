@@ -216,9 +216,20 @@ fn resolve_shell_timeout_secs(
     shell_tool_timeout_secs: Option<u64>,
 ) -> u64 {
     let autonomy_timeout = security.shell_timeout_secs.max(1);
-    match shell_tool_timeout_secs {
+    let resolved = match shell_tool_timeout_secs {
         Some(timeout) if timeout > 0 => autonomy_timeout.max(timeout),
         _ => autonomy_timeout,
+    };
+
+    if matches!(
+        security.autonomy,
+        zeroclaw_config::policy::AutonomyLevel::Full
+    ) {
+        // In yolo/full-autonomy mode we avoid short shell cutoffs that
+        // break long installs/downloads launched from channels.
+        resolved.max(86_400)
+    } else {
+        resolved
     }
 }
 
@@ -1043,6 +1054,17 @@ mod tests {
         };
         assert_eq!(resolve_shell_timeout_secs(&security, None), 1);
         assert_eq!(resolve_shell_timeout_secs(&security, Some(0)), 1);
+    }
+
+    #[test]
+    fn resolve_shell_timeout_is_extended_in_full_autonomy() {
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            shell_timeout_secs: 60,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(resolve_shell_timeout_secs(&security, None), 86_400);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 86_400);
     }
 
     #[test]

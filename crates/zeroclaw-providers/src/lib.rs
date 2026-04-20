@@ -710,6 +710,10 @@ pub struct ProviderRuntimeOptions {
     /// Maximum output tokens for LLM provider API requests.
     /// `None` uses the provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// API keys from named provider profiles (`[providers.models.<name>]`).
+    /// Used by routed providers so non-primary route targets can still use
+    /// per-provider credentials from config without relying on env vars.
+    pub provider_api_keys: std::collections::HashMap<String, String>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
@@ -728,6 +732,7 @@ impl Default for ProviderRuntimeOptions {
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_api_keys: std::collections::HashMap::new(),
             merge_system_into_user: false,
         }
     }
@@ -737,6 +742,23 @@ pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
     let fallback = config.providers.fallback_provider();
+    let mut provider_api_keys: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (profile_name, profile) in &config.providers.models {
+        if let Some(raw_key) = profile.api_key.as_deref() {
+            let key = raw_key.trim();
+            if !key.is_empty() {
+                provider_api_keys.insert(profile_name.clone(), key.to_string());
+                if let Some(provider_name) = profile.name.as_deref().map(str::trim)
+                    && !provider_name.is_empty()
+                {
+                    provider_api_keys
+                        .entry(provider_name.to_string())
+                        .or_insert_with(|| key.to_string());
+                }
+            }
+        }
+    }
     // Resolve merge_system_into_user from the active model provider profile by
     // matching api_url — apply_named_model_provider_profile() has already run
     // and rewritten providers.fallback, but providers.models retains all profiles.
@@ -770,6 +792,7 @@ pub fn provider_runtime_options_from_config(
             .unwrap_or_default(),
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
+        provider_api_keys,
         merge_system_into_user,
     }
 }
@@ -1284,20 +1307,24 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
-            "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::ZhipuJwt,
-        ))),
-        name if glm_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+        name if zai_base_url(name).is_some() => Ok(compat(
+            OpenAiCompatibleProvider::new_no_responses_fallback(
+                "Z.AI",
+                zai_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::ZhipuJwt,
+            )
+            .with_merge_system_into_user(),
+        )),
+        name if glm_base_url(name).is_some() => Ok(compat(
+            OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::ZhipuJwt,
-            )))
-        }
+            )
+            .with_merge_system_into_user(),
+        )),
         name if minimax_base_url(name).is_some() => Ok(compat(
             OpenAiCompatibleProvider::new_merge_system_into_user(
                 "MiniMax",
@@ -1781,12 +1808,14 @@ pub fn create_resilient_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let primary_credential =
+        effective_primary_provider_credential(primary_name, api_key, &options.provider_api_keys);
 
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
+            create_provider_with_options(primary_name, primary_credential, options)?
         }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
+        _ => create_provider_with_url_and_options(primary_name, primary_credential, api_url, options)?,
     };
     providers.push((primary_name.to_string(), primary_provider));
 
@@ -1814,8 +1843,10 @@ pub fn create_resilient_provider_with_options(
             }
             None => options.clone(),
         };
+        let fallback_credential =
+            routed_config_credential(provider_name, &fallback_options.provider_api_keys);
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        match create_provider_with_options(provider_name, fallback_credential, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -1899,7 +1930,14 @@ pub fn create_routed_provider_with_options(
                     (!trimmed_key.is_empty()).then_some(trimmed_key)
                 })
             });
-        let key = routed_credential.or(api_key);
+        let routed_config_credential = routed_config_credential(name, &options.provider_api_keys);
+        let key = routed_provider_credential(
+            name,
+            primary_name,
+            routed_credential,
+            routed_config_credential,
+            api_key,
+        );
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
         match create_resilient_provider_with_options(name, key, url, reliability, options) {
@@ -1935,6 +1973,52 @@ pub fn create_routed_provider_with_options(
         routes,
         default_model.to_string(),
     )))
+}
+
+fn routed_provider_credential<'a>(
+    provider_name: &str,
+    primary_name: &str,
+    routed_credential: Option<&'a str>,
+    routed_config_credential: Option<&'a str>,
+    primary_credential: Option<&'a str>,
+) -> Option<&'a str> {
+    if routed_credential.is_some() {
+        return routed_credential;
+    }
+    if routed_config_credential.is_some() {
+        return routed_config_credential;
+    }
+    if provider_name == primary_name {
+        return primary_credential;
+    }
+    None
+}
+
+fn routed_config_credential<'a>(
+    provider_name: &str,
+    provider_api_keys: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    if let Some(value) = provider_api_keys.get(provider_name).map(String::as_str) {
+        return Some(value);
+    }
+
+    let (provider_base, _) = parse_provider_profile(provider_name);
+    if provider_base != provider_name
+        && let Some(value) = provider_api_keys.get(provider_base).map(String::as_str)
+    {
+        return Some(value);
+    }
+
+    let canonical = canonical_china_provider_name(provider_base)?;
+    provider_api_keys.get(canonical).map(String::as_str)
+}
+
+fn effective_primary_provider_credential<'a>(
+    provider_name: &str,
+    primary_credential: Option<&'a str>,
+    provider_api_keys: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    routed_config_credential(provider_name, provider_api_keys).or(primary_credential)
 }
 
 /// Information about a supported provider for display purposes.
@@ -2806,6 +2890,23 @@ mod tests {
         assert!(create_provider("z.ai-cn", Some("key")).is_ok());
     }
 
+    #[tokio::test]
+    async fn zai_transport_error_does_not_attempt_responses_fallback() {
+        let provider =
+            create_provider_with_url("zai", Some("id.secret"), Some("http://127.0.0.1:1"))
+                .expect("zai provider should initialize");
+
+        let err = provider
+            .chat_with_system(None, "hello", "glm-5.1", 0.0)
+            .await
+            .expect_err("unreachable endpoint should fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("responses fallback failed"),
+            "zai should not attempt responses fallback, got: {msg}"
+        );
+    }
+
     #[test]
     fn factory_glm() {
         assert!(create_provider("glm", Some("key")).is_ok());
@@ -3277,6 +3378,41 @@ mod tests {
             &reliability,
         );
         assert!(provider.is_err());
+    }
+
+    #[tokio::test]
+    async fn routed_secondary_provider_does_not_inherit_primary_api_key() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            provider: "openrouter".into(),
+            model: "anthropic/claude-sonnet-4".into(),
+            api_key: None,
+        }];
+
+        // Primary uses an OpenAI key. If this key is incorrectly inherited by
+        // the routed OpenRouter provider, the route provider initialization is
+        // skipped due key-prefix mismatch, and `hint:fast` falls back to the
+        // primary provider. Correct behavior keeps route providers isolated.
+        let provider = create_routed_provider(
+            "openai",
+            Some("sk-test-openai-primary"),
+            Some("http://127.0.0.1:1/v1"),
+            &reliability,
+            &routes,
+            "gpt-4o-mini",
+        )
+        .expect("routed provider should initialize");
+
+        let err = provider
+            .chat_with_system(None, "hello", "hint:fast", 0.0)
+            .await
+            .expect_err("openrouter route without explicit key should fail fast");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OpenRouter API key not set"),
+            "expected routed OpenRouter auth error, got: {msg}"
+        );
     }
 
     /// Fallback providers resolve their own credentials via provider-specific
@@ -3757,6 +3893,7 @@ mod tests {
     fn provider_runtime_options_default_has_empty_extra_headers() {
         let options = ProviderRuntimeOptions::default();
         assert!(options.extra_headers.is_empty());
+        assert!(options.provider_api_keys.is_empty());
     }
 
     #[test]
@@ -3769,6 +3906,24 @@ mod tests {
         };
         assert_eq!(options.extra_headers.len(), 1);
         assert_eq!(options.extra_headers.get("X-Title").unwrap(), "zeroclaw");
+    }
+
+    #[test]
+    fn provider_runtime_options_include_named_provider_api_keys() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.insert(
+            "minimax".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("minimax-key".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.provider_api_keys.get("minimax").map(String::as_str),
+            Some("minimax-key")
+        );
     }
 
     #[test]
@@ -3789,5 +3944,82 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn routed_provider_credential_uses_route_override_first() {
+        let key = routed_provider_credential(
+            "minimax",
+            "openai",
+            Some("route-key"),
+            Some("profile-key"),
+            Some("primary-key"),
+        );
+        assert_eq!(key, Some("route-key"));
+    }
+
+    #[test]
+    fn routed_provider_credential_uses_profile_key_for_secondary_provider() {
+        let key = routed_provider_credential(
+            "minimax",
+            "openai",
+            None,
+            Some("profile-key"),
+            Some("primary-key"),
+        );
+        assert_eq!(key, Some("profile-key"));
+    }
+
+    #[test]
+    fn routed_provider_credential_only_inherits_primary_for_primary_provider() {
+        let secondary = routed_provider_credential("minimax", "openai", None, None, Some("pk"));
+        assert_eq!(secondary, None);
+
+        let primary = routed_provider_credential("openai", "openai", None, None, Some("pk"));
+        assert_eq!(primary, Some("pk"));
+    }
+
+    #[test]
+    fn routed_config_credential_resolves_canonical_alias() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("minimax".to_string(), "mm-key".to_string());
+
+        assert_eq!(
+            routed_config_credential("minimax-intl", &keys),
+            Some("mm-key")
+        );
+        assert_eq!(
+            routed_config_credential("minimax-cn", &keys),
+            Some("mm-key")
+        );
+    }
+
+    #[test]
+    fn routed_config_credential_resolves_provider_profile_name() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("minimax".to_string(), "mm-key".to_string());
+
+        assert_eq!(
+            routed_config_credential("minimax:analysis", &keys),
+            Some("mm-key")
+        );
+    }
+
+    #[test]
+    fn effective_primary_provider_credential_prefers_provider_profile_key() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("zai".to_string(), "zai-profile-key".to_string());
+
+        let resolved =
+            effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
+        assert_eq!(resolved, Some("zai-profile-key"));
+    }
+
+    #[test]
+    fn effective_primary_provider_credential_falls_back_when_profile_missing() {
+        let keys = std::collections::HashMap::new();
+        let resolved =
+            effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
+        assert_eq!(resolved, Some("fallback-key"));
     }
 }

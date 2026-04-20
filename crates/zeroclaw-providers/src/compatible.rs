@@ -1517,10 +1517,18 @@ impl OpenAiCompatibleProvider {
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()));
+                    // Some OpenAI-compatible providers (including Z.AI/GLM)
+                    // reject assistant tool-call history when `content` is null
+                    // or omitted. Normalize to an explicit text field.
+                    let content = match value.get("content") {
+                        Some(serde_json::Value::String(content)) => {
+                            Some(MessageContent::Text(content.clone()))
+                        }
+                        Some(serde_json::Value::Null) | None => {
+                            Some(MessageContent::Text(String::new()))
+                        }
+                        Some(other) => Some(MessageContent::Text(other.to_string())),
+                    };
 
                     let reasoning_content = value
                         .get("reasoning_content")
@@ -1643,6 +1651,30 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
+    fn collapse_messages_for_user_only_fallback(messages: &[ChatMessage]) -> String {
+        let mut lines = Vec::new();
+        for message in messages {
+            let content = message.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            let role = match message.role.as_str() {
+                "system" => "System",
+                "user" => "User",
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                other => other,
+            };
+            lines.push(format!("{role}: {content}"));
+        }
+
+        if lines.is_empty() {
+            "User: continue".to_string()
+        } else {
+            lines.join("\n\n")
+        }
+    }
+
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
@@ -1698,9 +1730,18 @@ impl OpenAiCompatibleProvider {
             "tool_choice",
             "tool call validation failed",
             "was not in request",
+            // Z.AI/GLM sometimes reports unsupported native-tool payloads as a
+            // generic messages validation error.
+            "messages parameter is illegal",
         ]
         .iter()
         .any(|hint| lower.contains(hint))
+    }
+
+    fn is_messages_parameter_illegal(error: &str) -> bool {
+        error
+            .to_lowercase()
+            .contains("messages parameter is illegal")
     }
 }
 
@@ -2108,9 +2149,33 @@ impl Provider for OpenAiCompatibleProvider {
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self
+                let text = match self
                     .chat_with_history(&fallback_messages, model, temperature)
-                    .await?;
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(history_error) => {
+                        // Some Z.AI endpoints reject multi-role history payloads
+                        // even after native tool fallback. Retry once with a
+                        // single user message that embeds role-tagged history.
+                        let history_error_str = history_error.to_string();
+                        if !(Self::is_messages_parameter_illegal(&sanitized)
+                            || Self::is_messages_parameter_illegal(&history_error_str))
+                        {
+                            return Err(history_error);
+                        }
+
+                        tracing::warn!(
+                            provider = self.name.as_str(),
+                            model,
+                            "Native-tool fallback still hit messages-schema error; retrying with collapsed single-user prompt"
+                        );
+                        let collapsed_prompt =
+                            Self::collapse_messages_for_user_only_fallback(&fallback_messages);
+                        self.chat_with_system(None, &collapsed_prompt, model, temperature)
+                            .await?
+                    }
+                };
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
@@ -3104,6 +3169,22 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_for_native_normalizes_null_assistant_tool_content() {
+        let input = vec![ChatMessage::assistant(
+            r#"{"content":null,"tool_calls":[{"id":"tc_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert!(converted[0].tool_calls.is_some());
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value.is_empty()
+        ));
+    }
+
+    #[test]
     fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
         let input = vec![ChatMessage::user(
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
@@ -3184,6 +3265,14 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_schema_unsupported_detects_zai_illegal_messages_error() {
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"Z.AI API error (400 Bad Request): {"error":{"code":"1214","message":"The messages parameter is illegal. Please check the documentation."}}"#
+        ));
+    }
+
+    #[test]
     fn prompt_guided_tool_fallback_injects_system_instruction() {
         let input = vec![ChatMessage::user("check status")];
         let tools = vec![zeroclaw_api::tool::ToolSpec {
@@ -3204,6 +3293,35 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[test]
+    fn collapse_messages_for_user_only_fallback_formats_roles() {
+        let input = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user("find updates"),
+            ChatMessage::assistant("working"),
+            ChatMessage::tool(r#"{"tool_call_id":"abc","content":"done"}"#),
+        ];
+
+        let collapsed = OpenAiCompatibleProvider::collapse_messages_for_user_only_fallback(&input);
+        assert!(collapsed.contains("System: policy"));
+        assert!(collapsed.contains("User: find updates"));
+        assert!(collapsed.contains("Assistant: working"));
+        assert!(collapsed.contains(r#"Tool: {"tool_call_id":"abc","content":"done"}"#));
+    }
+
+    #[test]
+    fn messages_parameter_illegal_detection_is_case_insensitive() {
+        assert!(OpenAiCompatibleProvider::is_messages_parameter_illegal(
+            "The messages parameter is illegal. Please check the documentation."
+        ));
+        assert!(OpenAiCompatibleProvider::is_messages_parameter_illegal(
+            "THE MESSAGES PARAMETER IS ILLEGAL"
+        ));
+        assert!(!OpenAiCompatibleProvider::is_messages_parameter_illegal(
+            "tool call validation failed"
+        ));
     }
 
     #[test]

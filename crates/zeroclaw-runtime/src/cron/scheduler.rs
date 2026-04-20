@@ -17,6 +17,9 @@ use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+const CRON_MIN_TOOL_ITERATIONS: usize = 24;
+const CRON_MAX_TOOL_RESULT_CHARS: usize = 16_000;
+const CRON_MAX_KEEP_TOOL_CONTEXT_TURNS: usize = 1;
 
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
@@ -295,22 +298,37 @@ async fn run_agent_job(
                     .map(|e| format!("- {}: {}", e.key, e.content))
                     .collect::<Vec<_>>()
                     .join("\n");
-                if ctx.is_empty() {
-                    String::new()
-                } else {
-                    format!("[Memory context]\n{ctx}\n\n")
-                }
+                ctx
             }
             _ => String::new(),
         },
         Err(_) => String::new(),
     };
 
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = build_cron_prompt(&job.id, &name, &prompt, &memory_context);
     let model_override = job.model.clone();
 
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
+    // Cron jobs are unattended and often need longer tool chains than
+    // interactive chats. Raise iteration floor and constrain large tool
+    // payloads to reduce context blowups on long transcript/file reads.
+    cron_config.agent.max_tool_iterations = cron_config
+        .agent
+        .max_tool_iterations
+        .max(CRON_MIN_TOOL_ITERATIONS);
+    cron_config.agent.max_tool_result_chars = if cron_config.agent.max_tool_result_chars == 0 {
+        CRON_MAX_TOOL_RESULT_CHARS
+    } else {
+        cron_config
+            .agent
+            .max_tool_result_chars
+            .min(CRON_MAX_TOOL_RESULT_CHARS)
+    };
+    cron_config.agent.keep_tool_context_turns = cron_config
+        .agent
+        .keep_tool_context_turns
+        .min(CRON_MAX_KEEP_TOOL_CONTEXT_TURNS);
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -344,6 +362,33 @@ async fn run_agent_job(
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
+}
+
+fn build_cron_prompt(job_id: &str, name: &str, prompt: &str, memory_context: &str) -> String {
+    let task = prompt.trim();
+    let task = if task.is_empty() {
+        "(no prompt provided)"
+    } else {
+        task
+    };
+
+    let memory_block = if memory_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n[MEMORY CONTEXT]\n{}\n", memory_context.trim())
+    };
+
+    format!(
+        "[cron:{job_id} {name}]\n\
+[EXECUTION MODE]\n\
+Unattended scheduled run.\n\n\
+[PRIMARY TASK - HIGHEST PRIORITY]\n\
+{task}\n\n\
+[EXECUTION RULES]\n\
+- Execute the task using tools when needed; do not only describe what you plan to do.\n\
+- Prefer concrete actions (file edits/commands) over narration.\n\
+- If blocked, report the exact blocker and the next action required.{memory_block}"
+    )
 }
 
 async fn persist_job_result(
@@ -736,6 +781,28 @@ mod tests {
             ..test_job("echo test")
         };
         assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn build_cron_prompt_prioritizes_primary_task() {
+        let prompt = build_cron_prompt(
+            "job-1",
+            "daily-run",
+            "Read progress.md and update it.",
+            "- note-a: previous success\n- note-b: current phase",
+        );
+
+        let task_idx = prompt.find("[PRIMARY TASK - HIGHEST PRIORITY]").unwrap();
+        let memory_idx = prompt.find("[MEMORY CONTEXT]").unwrap();
+        assert!(task_idx < memory_idx);
+        assert!(prompt.contains("do not only describe what you plan to do"));
+        assert!(prompt.contains("Read progress.md and update it."));
+    }
+
+    #[test]
+    fn build_cron_prompt_omits_memory_section_when_empty() {
+        let prompt = build_cron_prompt("job-2", "daily-run", "Do the task.", "");
+        assert!(!prompt.contains("[MEMORY CONTEXT]"));
     }
 
     #[tokio::test]

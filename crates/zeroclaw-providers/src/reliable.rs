@@ -2,8 +2,10 @@ use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
+use crate::{canonical_china_provider_name, is_glm_alias, is_minimax_alias, is_zai_alias};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -431,6 +433,102 @@ impl ReliableProvider {
             base
         }
     }
+
+    fn provider_order_for_model(&self, model: &str) -> Vec<usize> {
+        let Some((prefix, _)) = Self::split_model_provider_prefix(model) else {
+            return (0..self.providers.len()).collect();
+        };
+
+        let mut preferred = Vec::new();
+        let mut others = Vec::new();
+        for (idx, (provider_name, _)) in self.providers.iter().enumerate() {
+            if Self::provider_matches_model_prefix(provider_name, prefix) {
+                preferred.push(idx);
+            } else {
+                others.push(idx);
+            }
+        }
+
+        if preferred.is_empty() {
+            return (0..self.providers.len()).collect();
+        }
+        preferred.extend(others);
+        preferred
+    }
+
+    fn normalize_model_for_provider<'a>(
+        &self,
+        provider_name: &str,
+        model: &'a str,
+    ) -> Cow<'a, str> {
+        if let Some((prefix, bare_model)) = Self::split_model_provider_prefix(model)
+            && Self::provider_matches_model_prefix(provider_name, prefix)
+        {
+            return Self::normalize_provider_specific_model(provider_name, bare_model);
+        }
+        Self::normalize_provider_specific_model(provider_name, model)
+    }
+
+    fn split_model_provider_prefix(model: &str) -> Option<(&str, &str)> {
+        if model.starts_with("hint:") {
+            return None;
+        }
+        let (prefix, bare_model) = model.split_once('/')?;
+        if prefix.is_empty() || bare_model.is_empty() {
+            return None;
+        }
+        Some((prefix, bare_model))
+    }
+
+    fn provider_identity(name: &str) -> &str {
+        if name.starts_with("custom:") || name.starts_with("anthropic-custom:") {
+            return name;
+        }
+        name.split_once(':').map_or(name, |(provider, _)| provider)
+    }
+
+    fn provider_matches_model_prefix(provider_name: &str, model_prefix: &str) -> bool {
+        let provider_identity = Self::provider_identity(provider_name);
+
+        if provider_identity.eq_ignore_ascii_case(model_prefix) {
+            return true;
+        }
+
+        if let (Some(provider_canonical), Some(prefix_canonical)) = (
+            canonical_china_provider_name(provider_identity),
+            canonical_china_provider_name(model_prefix),
+        ) && provider_canonical == prefix_canonical
+        {
+            return true;
+        }
+
+        // Z.AI coding endpoint and GLM endpoint both use GLM model IDs.
+        (is_zai_alias(provider_identity) || is_glm_alias(provider_identity))
+            && (is_zai_alias(model_prefix) || is_glm_alias(model_prefix))
+    }
+
+    fn normalize_provider_specific_model<'a>(provider_name: &str, model: &'a str) -> Cow<'a, str> {
+        let provider_identity = Self::provider_identity(provider_name);
+        if is_minimax_alias(provider_identity)
+            && let Some(normalized) = Self::normalize_minimax_model(model)
+        {
+            return Cow::Owned(normalized);
+        }
+        Cow::Borrowed(model)
+    }
+
+    fn normalize_minimax_model(model: &str) -> Option<String> {
+        let lower = model.to_ascii_lowercase();
+        let normalized = match lower.as_str() {
+            "minimax-m2.7" => "MiniMax-M2.7",
+            "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed",
+            "minimax-m2.5" => "MiniMax-M2.5",
+            "minimax-m2.5-highspeed" => "MiniMax-M2.5-highspeed",
+            "minimax-m2.1" => "MiniMax-M2.1",
+            _ => return None,
+        };
+        Some(normalized.to_string())
+    }
 }
 
 #[async_trait]
@@ -460,12 +558,20 @@ impl Provider for ReliableProvider {
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for provider_idx in self.provider_order_for_model(current_model) {
+                let (provider_name, provider) = &self.providers[provider_idx];
+                let effective_model =
+                    self.normalize_model_for_provider(provider_name, current_model);
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_system(system_prompt, message, current_model, temperature)
+                        .chat_with_system(
+                            system_prompt,
+                            message,
+                            effective_model.as_ref(),
+                            temperature,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -490,7 +596,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                 );
                             }
                             return Ok(resp);
@@ -503,7 +609,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -524,7 +630,7 @@ impl Provider for ReliableProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                effective_model.as_ref(),
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -550,7 +656,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -561,7 +667,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -577,7 +683,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = effective_model.as_ref(),
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -609,12 +715,19 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for provider_idx in self.provider_order_for_model(current_model) {
+                let (provider_name, provider) = &self.providers[provider_idx];
+                let effective_model =
+                    self.normalize_model_for_provider(provider_name, current_model);
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_history(&effective_messages, current_model, temperature)
+                        .chat_with_history(
+                            &effective_messages,
+                            effective_model.as_ref(),
+                            temperature,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -641,7 +754,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                 );
                             }
                             return Ok(resp);
@@ -654,7 +767,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = effective_model.as_ref(),
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -668,7 +781,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -691,7 +804,7 @@ impl Provider for ReliableProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                effective_model.as_ref(),
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -715,7 +828,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -726,7 +839,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -742,7 +855,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = effective_model.as_ref(),
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -780,12 +893,20 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for provider_idx in self.provider_order_for_model(current_model) {
+                let (provider_name, provider) = &self.providers[provider_idx];
+                let effective_model =
+                    self.normalize_model_for_provider(provider_name, current_model);
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
                     match provider
-                        .chat_with_tools(&effective_messages, tools, current_model, temperature)
+                        .chat_with_tools(
+                            &effective_messages,
+                            tools,
+                            effective_model.as_ref(),
+                            temperature,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -812,7 +933,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                 );
                             }
                             return Ok(resp);
@@ -825,7 +946,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = effective_model.as_ref(),
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -839,7 +960,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -862,7 +983,7 @@ impl Provider for ReliableProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                effective_model.as_ref(),
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -886,7 +1007,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -897,7 +1018,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -913,7 +1034,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = effective_model.as_ref(),
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -937,7 +1058,10 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for provider_idx in self.provider_order_for_model(current_model) {
+                let (provider_name, provider) = &self.providers[provider_idx];
+                let effective_model =
+                    self.normalize_model_for_provider(provider_name, current_model);
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -945,7 +1069,10 @@ impl Provider for ReliableProvider {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    match provider
+                        .chat(req, effective_model.as_ref(), temperature)
+                        .await
+                    {
                         Ok(resp) => {
                             if attempt > 0
                                 || *current_model != model
@@ -970,7 +1097,7 @@ impl Provider for ReliableProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                 );
                             }
                             return Ok(resp);
@@ -983,7 +1110,7 @@ impl Provider for ReliableProvider {
                                     context_truncated = true;
                                     tracing::warn!(
                                         provider = provider_name,
-                                        model = *current_model,
+                                        model = effective_model.as_ref(),
                                         dropped,
                                         remaining = effective_messages.len(),
                                         "Context window exceeded; truncated history and retrying"
@@ -997,7 +1124,7 @@ impl Provider for ReliableProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    effective_model.as_ref(),
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -1020,7 +1147,7 @@ impl Provider for ReliableProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                effective_model.as_ref(),
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -1044,7 +1171,7 @@ impl Provider for ReliableProvider {
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
@@ -1055,7 +1182,7 @@ impl Provider for ReliableProvider {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
                                     provider = provider_name,
-                                    model = *current_model,
+                                    model = effective_model.as_ref(),
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
@@ -1071,7 +1198,7 @@ impl Provider for ReliableProvider {
 
                 tracing::warn!(
                     provider = provider_name,
-                    model = *current_model,
+                    model = effective_model.as_ref(),
                     "Exhausted retries, trying next provider/model"
                 );
             }
@@ -1110,7 +1237,8 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for (provider_name, provider) in &self.providers {
+        for provider_idx in self.provider_order_for_model(model) {
+            let (provider_name, provider) = &self.providers[provider_idx];
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1127,12 +1255,15 @@ impl Provider for ReliableProvider {
                 .copied()
                 .unwrap_or(model)
                 .to_string();
+            let effective_model = self
+                .normalize_model_for_provider(provider_name, &current_model)
+                .into_owned();
 
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
             };
-            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let stream = provider.stream_chat(req, &effective_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
             tokio::spawn(async move {
@@ -1141,7 +1272,7 @@ impl Provider for ReliableProvider {
                     if let Err(ref e) = event {
                         tracing::warn!(
                             provider = provider_clone,
-                            model = current_model,
+                            model = effective_model,
                             "Streaming error: {e}"
                         );
                     }
@@ -1175,7 +1306,8 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming
         // For streaming, we use the first provider that supports it and has streaming enabled
-        for (provider_name, provider) in &self.providers {
+        for provider_idx in self.provider_order_for_model(model) {
+            let (provider_name, provider) = &self.providers[provider_idx];
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1188,13 +1320,16 @@ impl Provider for ReliableProvider {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
+            let effective_model = self
+                .normalize_model_for_provider(provider_name, &current_model)
+                .into_owned();
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
             let stream = provider.stream_chat_with_system(
                 system_prompt,
                 message,
-                &current_model,
+                &effective_model,
                 temperature,
                 options,
             );
@@ -1208,7 +1343,7 @@ impl Provider for ReliableProvider {
                     if let Err(ref e) = chunk {
                         tracing::warn!(
                             provider = provider_clone,
-                            model = current_model,
+                            model = effective_model,
                             "Streaming error: {e}"
                         );
                     }
@@ -1244,7 +1379,8 @@ impl Provider for ReliableProvider {
         // Try each provider/model combination for streaming with history.
         // Mirrors stream_chat_with_system but delegates to the underlying
         // provider's stream_chat_with_history, preserving the full conversation.
-        for (provider_name, provider) in &self.providers {
+        for provider_idx in self.provider_order_for_model(model) {
+            let (provider_name, provider) = &self.providers[provider_idx];
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1255,9 +1391,12 @@ impl Provider for ReliableProvider {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
+            let effective_model = self
+                .normalize_model_for_provider(provider_name, &current_model)
+                .into_owned();
 
             let stream =
-                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+                provider.stream_chat_with_history(messages, &effective_model, temperature, options);
 
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -1267,7 +1406,7 @@ impl Provider for ReliableProvider {
                     if let Err(ref e) = chunk {
                         tracing::warn!(
                             provider = provider_clone,
-                            model = current_model,
+                            model = effective_model,
                             "Streaming error: {e}"
                         );
                     }
@@ -1788,6 +1927,105 @@ mod tests {
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_prefixed_model_targets_matching_provider_first() {
+        let primary = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["minimax/minimax-m2.7"],
+            response: "wrong-provider-should-not-run",
+        });
+        let minimax = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "ok from minimax",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "zai".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "minimax".into(),
+                    Box::new(Arc::clone(&minimax)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let result = provider
+            .simple_chat("hello", "minimax/minimax-m2.7", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from minimax");
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            0,
+            "matching provider should be attempted first and succeed"
+        );
+        assert_eq!(minimax.calls.load(Ordering::SeqCst), 1);
+        let seen = minimax.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["MiniMax-M2.7".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn provider_prefixed_model_is_stripped_before_provider_call() {
+        let zai = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "ok from zai",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "zai".into(),
+                Box::new(Arc::clone(&zai)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let result = provider
+            .simple_chat("hello", "zai/glm-5.1", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from zai");
+        let seen = zai.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["glm-5.1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn minimax_lowercase_model_is_normalized_for_provider_call() {
+        let minimax = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "ok from minimax",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "minimax".into(),
+                Box::new(Arc::clone(&minimax)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let result = provider
+            .simple_chat("hello", "minimax-m2.7", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from minimax");
+        let seen = minimax.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["MiniMax-M2.7".to_string()]);
     }
 
     // ── New tests: auth rotation ──
@@ -2347,6 +2585,116 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], "claude-opus");
         assert_eq!(seen[1], "claude-sonnet");
+    }
+
+    #[tokio::test]
+    async fn chat_provider_prefixed_model_targets_matching_provider_first() {
+        let primary = Arc::new(NativeModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["minimax/minimax-m2.7", "minimax-m2.7"],
+            response_text: "wrong-provider",
+        });
+        let minimax = Arc::new(NativeModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response_text: "ok from minimax",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "zai".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "minimax".into(),
+                    Box::new(Arc::clone(&minimax)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let result = provider
+            .chat(request, "minimax/minimax-m2.7", 0.0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text.as_deref(), Some("ok from minimax"));
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            0,
+            "zai should not be attempted first for minimax/* model IDs"
+        );
+        let seen = minimax.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["MiniMax-M2.7".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chat_provider_prefixed_model_is_stripped_for_matching_provider() {
+        let zai = Arc::new(NativeModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response_text: "ok from zai",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "zai".into(),
+                Box::new(Arc::clone(&zai)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let result = provider.chat(request, "zai/glm-5.1", 0.0).await.unwrap();
+
+        assert_eq!(result.text.as_deref(), Some("ok from zai"));
+        let seen = zai.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["glm-5.1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chat_minimax_lowercase_model_is_normalized_for_provider_call() {
+        let minimax = Arc::new(NativeModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response_text: "ok from minimax",
+        });
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "minimax".into(),
+                Box::new(Arc::clone(&minimax)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let result = provider.chat(request, "minimax-m2.7", 0.0).await.unwrap();
+
+        assert_eq!(result.text.as_deref(), Some("ok from minimax"));
+        let seen = minimax.models_seen.lock();
+        assert_eq!(seen.as_slice(), &["MiniMax-M2.7".to_string()]);
     }
 
     /// Gap 4: `chat()` skips retries on non-retryable errors (401, 403, etc.),
