@@ -966,6 +966,10 @@ impl SecurityPolicy {
         }
     }
 
+    fn is_unrestricted_shell_mode(&self) -> bool {
+        self.allowed_commands.iter().any(|c| c.trim() == "*") && !self.block_high_risk_commands
+    }
+
     // ── Command Execution Policy Gate ──────────────────────────────────────
     // Validation follows a strict precedence order:
     //   1. Allowlist check (is the base command permitted at all?)
@@ -993,8 +997,7 @@ impl SecurityPolicy {
         // disabled `block_high_risk_commands`, they have opted out of all
         // command-level restrictions.  Short-circuit: skip the risk and
         // autonomy gates entirely.  See #4485.
-        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
-        if has_wildcard && !self.block_high_risk_commands {
+        if self.is_unrestricted_shell_mode() {
             return Ok(risk);
         }
 
@@ -1090,10 +1093,15 @@ impl SecurityPolicy {
         }
 
         // Explicit "YOLO" operator opt-out: wildcard allowlist with
-        // block_high_risk_commands=false disables argument-level blocks.
-        // Keep all other structural shell safety checks below in place.
-        let allow_dangerous_args =
-            self.allowed_commands.iter().any(|c| c.trim() == "*") && !self.block_high_risk_commands;
+        // block_high_risk_commands=false disables shell command guards,
+        // including background/nohup/redirection checks.
+        if self.is_unrestricted_shell_mode() {
+            let segments = split_unquoted_segments(command);
+            return segments.iter().any(|s| {
+                let s = skip_env_assignments(s.trim());
+                s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            });
+        }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
@@ -1170,7 +1178,7 @@ impl SecurityPolicy {
 
             // Validate arguments for the command
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !allow_dangerous_args && !self.is_args_safe(base_cmd, &args) {
+            if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
         }
@@ -1262,6 +1270,10 @@ impl SecurityPolicy {
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        if self.is_unrestricted_shell_mode() {
+            return None;
+        }
+
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -3534,6 +3546,30 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_with_block_high_risk_false_allows_background_redirect_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed(
+            "nohup python3 -m pip download nemo_toolkit > /tmp/model.log 2>&1 &"
+        ));
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_false_skips_forbidden_path_argument_guard() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(p.forbidden_path_argument("cat /etc/passwd"), None);
+    }
+
+    #[test]
     fn wildcard_with_block_high_risk_true_still_blocks() {
         // Ensure the existing safety net is preserved: wildcard + block_high_risk_commands=true
         // should still block high-risk commands.
@@ -3557,6 +3593,19 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.is_command_allowed("pip install requests"));
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_true_still_blocks_background_redirect_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed(
+            "nohup python3 -m pip download nemo_toolkit > /tmp/model.log 2>&1 &"
+        ));
     }
 
     #[test]
