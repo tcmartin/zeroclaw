@@ -1089,6 +1089,12 @@ impl SecurityPolicy {
             return false;
         }
 
+        // Explicit "YOLO" operator opt-out: wildcard allowlist with
+        // block_high_risk_commands=false disables argument-level blocks.
+        // Keep all other structural shell safety checks below in place.
+        let allow_dangerous_args =
+            self.allowed_commands.iter().any(|c| c.trim() == "*") && !self.block_high_risk_commands;
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
         // bypassing path checks through variable indirection. The helper below
@@ -1164,7 +1170,7 @@ impl SecurityPolicy {
 
             // Validate arguments for the command
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
+            if !allow_dangerous_args && !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
         }
@@ -3517,6 +3523,17 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_with_block_high_risk_false_allows_pip_install_args() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("pip install requests"));
+    }
+
+    #[test]
     fn wildcard_with_block_high_risk_true_still_blocks() {
         // Ensure the existing safety net is preserved: wildcard + block_high_risk_commands=true
         // should still block high-risk commands.
@@ -3529,6 +3546,17 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_true_still_blocks_pip_install_args() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("pip install requests"));
     }
 
     #[test]
