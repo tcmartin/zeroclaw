@@ -1148,6 +1148,11 @@ impl DelegateTool {
         let agentic_timeout_secs = agent_config
             .agentic_timeout_secs
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
+        let max_iterations = if self.security.autonomy == crate::security::AutonomyLevel::Full {
+            usize::MAX
+        } else {
+            agent_config.max_iterations
+        };
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
@@ -1163,7 +1168,7 @@ impl DelegateTool {
                 "delegate",
                 None,
                 &self.multimodal_config,
-                agent_config.max_iterations,
+                max_iterations,
                 None,
                 None,
                 None,

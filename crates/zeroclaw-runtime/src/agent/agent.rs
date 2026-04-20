@@ -19,6 +19,8 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 
+const DEFAULT_AGENT_MAX_TOOL_ITERATIONS: usize = 10;
+
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
@@ -336,6 +338,16 @@ impl AgentBuilder {
 }
 
 impl Agent {
+    fn effective_max_tool_iterations(&self) -> Option<usize> {
+        if self.autonomy_level == crate::security::AutonomyLevel::Full {
+            None
+        } else if self.config.max_tool_iterations == 0 {
+            Some(DEFAULT_AGENT_MAX_TOOL_ITERATIONS)
+        } else {
+            Some(self.config.max_tool_iterations)
+        }
+    }
+
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
     }
@@ -864,7 +876,8 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
+        let max_tool_iterations = self.effective_max_tool_iterations();
+        for _ in 0..max_tool_iterations.unwrap_or(usize::MAX) {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
@@ -976,10 +989,10 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        if let Some(limit) = max_tool_iterations {
+            anyhow::bail!("Agent exceeded maximum tool iterations ({limit})")
+        }
+        anyhow::bail!("Agent stopped without producing a final response in full autonomy mode")
     }
 
     /// Execute a single agent turn while streaming intermediate events.
@@ -1039,7 +1052,8 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.max_tool_iterations {
+        let max_tool_iterations = self.effective_max_tool_iterations();
+        for _ in 0..max_tool_iterations.unwrap_or(usize::MAX) {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1267,10 +1281,10 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        if let Some(limit) = max_tool_iterations {
+            anyhow::bail!("Agent exceeded maximum tool iterations ({limit})")
+        }
+        anyhow::bail!("Agent stopped without producing a final response in full autonomy mode")
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

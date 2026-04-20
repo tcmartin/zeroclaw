@@ -29,6 +29,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::observability::{NoopObserver, Observer};
+use crate::security::AutonomyLevel;
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -326,6 +327,25 @@ fn build_agent_with_config(
         .unwrap()
 }
 
+fn build_agent_with_config_and_autonomy(
+    provider: Box<dyn Provider>,
+    tools: Vec<Box<dyn Tool>>,
+    config: AgentConfig,
+    autonomy_level: AutonomyLevel,
+) -> Agent {
+    Agent::builder()
+        .provider(provider)
+        .tools(tools)
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .config(config)
+        .autonomy_level(autonomy_level)
+        .build()
+        .unwrap()
+}
+
 /// Helper: create a ChatResponse with tool calls (native format).
 fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
@@ -480,6 +500,37 @@ async fn turn_bails_out_at_max_iterations() {
         err.contains("maximum tool iterations"),
         "Expected max iterations error, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn turn_full_autonomy_ignores_max_iterations_limit() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        tool_response(vec![ToolCall {
+            id: "tc1".into(),
+            name: "echo".into(),
+            arguments: r#"{"message":"one"}"#.into(),
+        }]),
+        tool_response(vec![ToolCall {
+            id: "tc2".into(),
+            name: "echo".into(),
+            arguments: r#"{"message":"two"}"#.into(),
+        }]),
+        text_response("done"),
+    ]));
+
+    let config = AgentConfig {
+        max_tool_iterations: 1,
+        ..AgentConfig::default()
+    };
+
+    let mut agent = build_agent_with_config_and_autonomy(
+        provider,
+        vec![Box::new(EchoTool)],
+        config,
+        AutonomyLevel::Full,
+    );
+    let response = agent.turn("run more than one tool call").await.unwrap();
+    assert_eq!(response, "done");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

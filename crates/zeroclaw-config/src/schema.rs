@@ -1414,7 +1414,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub compact_context: bool,
     /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// Setting to `0` falls back to the safe default of `10` in non-full modes.
+    /// In full autonomy mode, the runtime treats tool iterations as unbounded.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `50`.
@@ -9941,7 +9942,7 @@ impl Config {
         }
 
         // Autonomy
-        if self.autonomy.max_actions_per_hour == 0 {
+        if self.autonomy.level != AutonomyLevel::Full && self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
         }
         for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
@@ -11871,6 +11872,23 @@ auto_approve = ["file_read", "memory_recall", "http_request"]
                 .contains(&"http_request".to_string()),
             "autonomy.auto_approve must include http_request from config"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_max_actions_in_supervised_mode() {
+        let mut cfg = Config::default();
+        cfg.autonomy.level = AutonomyLevel::Supervised;
+        cfg.autonomy.max_actions_per_hour = 0;
+        let err = cfg.validate().expect_err("expected validation failure");
+        assert!(format!("{err}").contains("autonomy.max_actions_per_hour must be greater than 0"));
+    }
+
+    #[test]
+    async fn validate_allows_zero_max_actions_in_full_mode() {
+        let mut cfg = Config::default();
+        cfg.autonomy.level = AutonomyLevel::Full;
+        cfg.autonomy.max_actions_per_hour = 0;
+        assert!(cfg.validate().is_ok());
     }
 
     /// Regression test for #4247: when a user provides a custom auto_approve

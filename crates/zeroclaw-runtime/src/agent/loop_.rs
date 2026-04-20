@@ -70,6 +70,8 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+/// Sentinel for unbounded tool-call iterations (used in full autonomy mode).
+const UNBOUNDED_TOOL_ITERATIONS: usize = usize::MAX;
 
 // History management moved to `super::history`.
 pub use super::history::{
@@ -676,6 +678,19 @@ pub async fn agent_turn(
     .await
 }
 
+fn effective_tool_iterations_for_autonomy(
+    autonomy_level: AutonomyLevel,
+    configured_max_tool_iterations: usize,
+) -> usize {
+    if autonomy_level == AutonomyLevel::Full {
+        UNBOUNDED_TOOL_ITERATIONS
+    } else if configured_max_tool_iterations == 0 {
+        DEFAULT_MAX_TOOL_ITERATIONS
+    } else {
+        configured_max_tool_iterations
+    }
+}
+
 fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
@@ -812,11 +827,14 @@ pub async fn run_tool_call_loop(
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
-    let max_iterations = if max_tool_iterations == 0 {
-        DEFAULT_MAX_TOOL_ITERATIONS
+    let max_iterations = if max_tool_iterations == UNBOUNDED_TOOL_ITERATIONS {
+        None
+    } else if max_tool_iterations == 0 {
+        Some(DEFAULT_MAX_TOOL_ITERATIONS)
     } else {
-        max_tool_iterations
+        Some(max_tool_iterations)
     };
+    let unbounded_iterations = max_iterations.is_none();
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -830,7 +848,7 @@ pub async fn run_tool_call_loop(
 
     let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
         crate::agent::loop_detector::LoopDetectorConfig {
-            enabled: pacing.loop_detection_enabled,
+            enabled: pacing.loop_detection_enabled && !unbounded_iterations,
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
         },
@@ -839,7 +857,7 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
 
-    for iteration in 0..max_iterations {
+    for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
         if cancellation_token
@@ -1026,11 +1044,12 @@ pub async fn run_tool_call_loop(
         }
 
         // Budget enforcement — block if limit exceeded (no-op when not scoped)
-        if let Some(BudgetCheck::Exceeded {
-            current_usd,
-            limit_usd,
-            period,
-        }) = check_tool_loop_budget()
+        if !unbounded_iterations
+            && let Some(BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+            }) = check_tool_loop_budget()
         {
             return Err(anyhow::anyhow!(
                 "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
@@ -1844,9 +1863,13 @@ pub async fn run_tool_call_loop(
         // workflows while keeping aggressive protection for quick tasks.
         // When not configured, identical-output detection is disabled (preserving
         // existing behavior where only max_iterations prevents runaway loops).
-        let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
-            Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
-            None => false, // disabled when not configured (backwards compatible)
+        let loop_detection_active = if unbounded_iterations {
+            false
+        } else {
+            match pacing.loop_detection_min_elapsed_secs {
+                Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
+                None => false, // disabled when not configured (backwards compatible)
+            }
         };
 
         if loop_detection_active && !detection_relevant_output.is_empty() {
@@ -1919,6 +1942,10 @@ pub async fn run_tool_call_loop(
         }
     }
 
+    if unbounded_iterations {
+        anyhow::bail!("Agent tool loop stopped without a final response in unbounded mode")
+    }
+
     runtime_trace::record_event(
         "tool_loop_exhausted",
         Some(channel_name),
@@ -1934,7 +1961,7 @@ pub async fn run_tool_call_loop(
 
     // Graceful shutdown: ask the LLM for a final summary without tools
     tracing::warn!(
-        max_iterations,
+        max_iterations = max_iterations.unwrap_or(DEFAULT_MAX_TOOL_ITERATIONS),
         "Max iterations reached, requesting final summary"
     );
     history.push(ChatMessage::user(
@@ -1952,14 +1979,20 @@ pub async fn run_tool_call_loop(
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
-                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+                anyhow::bail!(
+                    "Agent exceeded maximum tool iterations ({})",
+                    max_iterations.unwrap_or(DEFAULT_MAX_TOOL_ITERATIONS)
+                )
             }
             accumulated_display_text.push_str(&text);
             Ok(accumulated_display_text)
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            anyhow::bail!(
+                "Agent exceeded maximum tool iterations ({})",
+                max_iterations.unwrap_or(DEFAULT_MAX_TOOL_ITERATIONS)
+            )
         }
     }
 }
@@ -2529,7 +2562,10 @@ pub async fn run(
                         channel_name,
                         None,
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
+                        effective_tool_iterations_for_autonomy(
+                            config.autonomy.level,
+                            config.agent.max_tool_iterations,
+                        ),
                         None,
                         None,
                         None,
@@ -2839,7 +2875,10 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            config.agent.max_tool_iterations,
+                            effective_tool_iterations_for_autonomy(
+                                config.autonomy.level,
+                                config.agent.max_tool_iterations,
+                            ),
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
                             None,
@@ -3358,7 +3397,10 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
-        config.agent.max_tool_iterations,
+        effective_tool_iterations_for_autonomy(
+            config.autonomy.level,
+            config.agent.max_tool_iterations,
+        ),
         Some(&approval_manager),
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
@@ -3372,11 +3414,14 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-        load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
+        DEFAULT_MAX_TOOL_ITERATIONS, UNBOUNDED_TOOL_ITERATIONS,
+        effective_tool_iterations_for_autonomy, emergency_history_trim, estimate_history_tokens,
+        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
+        truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
+    use crate::security::AutonomyLevel;
     use tempfile::tempdir;
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
@@ -6359,6 +6404,22 @@ mod tests {
     #[test]
     fn constants_bounds_are_compile_time_checked() {
         // Bounds are enforced by the const assertions above.
+    }
+
+    #[test]
+    fn effective_tool_iterations_for_autonomy_full_is_unbounded() {
+        assert_eq!(
+            effective_tool_iterations_for_autonomy(AutonomyLevel::Full, 3),
+            UNBOUNDED_TOOL_ITERATIONS
+        );
+    }
+
+    #[test]
+    fn effective_tool_iterations_for_autonomy_supervised_uses_default_when_zero() {
+        assert_eq!(
+            effective_tool_iterations_for_autonomy(AutonomyLevel::Supervised, 0),
+            DEFAULT_MAX_TOOL_ITERATIONS
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

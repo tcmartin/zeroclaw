@@ -1540,11 +1540,17 @@ impl SecurityPolicy {
     /// Record an action for the current sender and check if rate-limited.
     /// Returns `true` if allowed, `false` if budget exhausted.
     pub fn record_action(&self) -> bool {
+        if self.autonomy == AutonomyLevel::Full {
+            return true;
+        }
         self.tracker.record_for_current(self.max_actions_per_hour)
     }
 
     /// Check if the current sender would be rate-limited without recording.
     pub fn is_rate_limited(&self) -> bool {
+        if self.autonomy == AutonomyLevel::Full {
+            return false;
+        }
         self.tracker
             .is_limited_for_current(self.max_actions_per_hour)
     }
@@ -1709,11 +1715,18 @@ impl SecurityPolicy {
         }
 
         // Rate limit
-        let _ = writeln!(
-            out,
-            "**Rate limit**: max {} actions per hour per chat (each conversation has its own independent budget).",
-            self.max_actions_per_hour
-        );
+        if self.autonomy == AutonomyLevel::Full {
+            let _ = writeln!(
+                out,
+                "**Rate limit**: disabled in full autonomy mode (no per-chat action budget)."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "**Rate limit**: max {} actions per hour per chat (each conversation has its own independent budget).",
+                self.max_actions_per_hour
+            );
+        }
 
         out
     }
@@ -2873,10 +2886,24 @@ mod tests {
     #[test]
     fn rate_limit_zero_blocks_everything() {
         let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         };
         assert!(!p.record_action());
+    }
+
+    #[test]
+    fn rate_limit_zero_does_not_block_full_autonomy() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 0,
+            ..SecurityPolicy::default()
+        };
+        for _ in 0..5 {
+            assert!(p.record_action());
+        }
+        assert!(!p.is_rate_limited());
     }
 
     #[test]

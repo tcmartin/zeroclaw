@@ -211,6 +211,17 @@ fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
 
+fn effective_channel_max_tool_iterations(
+    autonomy_level: AutonomyLevel,
+    configured: usize,
+) -> usize {
+    if autonomy_level == AutonomyLevel::Full {
+        usize::MAX
+    } else {
+        configured
+    }
+}
+
 #[cfg(test)]
 fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
@@ -5475,7 +5486,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
-        max_tool_iterations: config.agent.max_tool_iterations,
+        max_tool_iterations: effective_channel_max_tool_iterations(
+            config.autonomy.level,
+            config.agent.max_tool_iterations,
+        ),
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -5765,6 +5779,18 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn effective_channel_max_tool_iterations_unbounded_in_full_mode() {
+        assert_eq!(
+            effective_channel_max_tool_iterations(AutonomyLevel::Full, 3),
+            usize::MAX
+        );
+        assert_eq!(
+            effective_channel_max_tool_iterations(AutonomyLevel::Supervised, 3),
+            3
+        );
     }
 
     #[test]
