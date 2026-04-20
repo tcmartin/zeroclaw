@@ -205,6 +205,23 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+/// Resolve the effective shell timeout used by the runtime shell tool.
+///
+/// Compatibility rules:
+/// - Always respect `[autonomy].shell_timeout_secs` (legacy and policy-backed).
+/// - If `[shell_tool].timeout_secs` is configured higher, use that value.
+/// - Never allow a zero-second timeout.
+fn resolve_shell_timeout_secs(
+    security: &SecurityPolicy,
+    shell_tool_timeout_secs: Option<u64>,
+) -> u64 {
+    let autonomy_timeout = security.shell_timeout_secs.max(1);
+    match shell_tool_timeout_secs {
+        Some(timeout) if timeout > 0 => autonomy_timeout.max(timeout),
+        _ => autonomy_timeout,
+    }
+}
+
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -215,9 +232,13 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
+    let shell_timeout_secs = resolve_shell_timeout_secs(&security, None);
     vec![
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            PathGuardedTool::new(
+                ShellTool::new(security.clone(), runtime).with_timeout_secs(shell_timeout_secs),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(FileReadTool::new(security.clone())),
@@ -332,11 +353,13 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
+    let shell_timeout_secs =
+        resolve_shell_timeout_secs(security, Some(root_config.shell_tool.timeout_secs));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
+                    .with_timeout_secs(shell_timeout_secs),
                 security.clone(),
             ),
             security.clone(),
@@ -991,6 +1014,35 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn resolve_shell_timeout_prefers_autonomy_timeout() {
+        let security = SecurityPolicy {
+            shell_timeout_secs: 3600,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(resolve_shell_timeout_secs(&security, None), 3600);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 3600);
+    }
+
+    #[test]
+    fn resolve_shell_timeout_uses_larger_shell_tool_timeout() {
+        let security = SecurityPolicy {
+            shell_timeout_secs: 120,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(3600)), 3600);
+    }
+
+    #[test]
+    fn resolve_shell_timeout_never_returns_zero() {
+        let security = SecurityPolicy {
+            shell_timeout_secs: 0,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(resolve_shell_timeout_secs(&security, None), 1);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(0)), 1);
     }
 
     #[test]

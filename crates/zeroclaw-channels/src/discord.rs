@@ -632,6 +632,16 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+/// Clamp a byte index down to the nearest valid UTF-8 character boundary.
+/// Used for persisted byte offsets that may be stale after content changes.
+fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
+    let mut clamped = idx.min(s.len());
+    while clamped > 0 && !s.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
+}
+
 /// Split a message into multiple logical chunks at paragraph boundaries for
 /// multi-message delivery. Respects code fences — never splits inside a
 /// fenced code block. Falls back to [`split_message_for_discord`] for any
@@ -1403,17 +1413,24 @@ impl Channel for DiscordChannel {
                         .flatten();
                     let mut sent_map = self.multi_message_sent_len.lock();
                     let sent_so_far = sent_map.get(recipient).copied().unwrap_or(0);
+                    let safe_sent_so_far = clamp_to_char_boundary(text, sent_so_far);
+                    if safe_sent_so_far != sent_so_far {
+                        tracing::warn!(
+                            "Discord multi-message offset was not UTF-8 aligned; normalizing"
+                        );
+                        sent_map.insert(recipient.to_string(), safe_sent_so_far);
+                    }
 
                     // DraftEvent::Clear resets accumulated text — reset our counter.
-                    if text.len() < sent_so_far {
+                    if text.len() < safe_sent_so_far {
                         sent_map.insert(recipient.to_string(), 0);
                         return Ok(());
                     }
-                    if text.len() == sent_so_far {
+                    if text.len() == safe_sent_so_far {
                         return Ok(());
                     }
 
-                    let new_text = &text[sent_so_far..];
+                    let new_text = &text[safe_sent_so_far..];
                     let mut scan_pos = 0;
                     let mut in_fence = false;
                     let bytes = new_text.as_bytes();
@@ -1489,8 +1506,9 @@ impl Channel for DiscordChannel {
                 .lock()
                 .remove(recipient)
                 .unwrap_or(0);
-            if text.len() > sent_so_far {
-                let remaining = text[sent_so_far..].trim().to_string();
+            let safe_sent_so_far = clamp_to_char_boundary(text, sent_so_far);
+            if text.len() > safe_sent_so_far {
+                let remaining = text[safe_sent_so_far..].trim().to_string();
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
                     if let Err(e) = self.send(&msg).await {
@@ -1945,6 +1963,17 @@ mod tests {
     }
 
     #[test]
+    fn clamp_to_char_boundary_normalizes_multibyte_indices() {
+        let text = "A—B";
+        assert_eq!(clamp_to_char_boundary(text, 0), 0);
+        assert_eq!(clamp_to_char_boundary(text, 1), 1);
+        assert_eq!(clamp_to_char_boundary(text, 2), 1);
+        assert_eq!(clamp_to_char_boundary(text, 3), 1);
+        assert_eq!(clamp_to_char_boundary(text, 4), 4);
+        assert_eq!(clamp_to_char_boundary(text, 10), text.len());
+    }
+
+    #[test]
     fn split_chunks_always_within_discord_limit() {
         let msg = "x".repeat(12_345);
         let chunks = split_message_for_discord(&msg);
@@ -2371,6 +2400,52 @@ mod tests {
         // Should return Ok immediately (rate-limited) without making a network call.
         let result = ch.update_draft("chan", "fake_msg_id", "new text").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_draft_multimessage_normalizes_invalid_utf8_offset() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+            StreamMode::MultiMessage,
+            1000,
+            0,
+        );
+        ch.multi_message_sent_len
+            .lock()
+            .insert("chan".to_string(), 2);
+        let result = ch
+            .update_draft("chan", "fake_msg_id", "— no paragraph break")
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            ch.multi_message_sent_len.lock().get("chan").copied(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multimessage_normalizes_invalid_utf8_offset() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+            StreamMode::MultiMessage,
+            1000,
+            0,
+        );
+        ch.multi_message_sent_len
+            .lock()
+            .insert("chan".to_string(), 2);
+        ch.multi_message_thread_ts
+            .lock()
+            .insert("chan".to_string(), None);
+
+        let result = ch
+            .finalize_draft("chan", "fake_msg_id", "— final text")
+            .await;
+        assert!(result.is_ok());
+        assert!(!ch.multi_message_sent_len.lock().contains_key("chan"));
+        assert!(!ch.multi_message_thread_ts.lock().contains_key("chan"));
     }
 
     #[tokio::test]

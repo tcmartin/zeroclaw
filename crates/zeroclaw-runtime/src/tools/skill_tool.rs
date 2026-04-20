@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
-const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -152,8 +150,8 @@ impl Tool for SkillShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let timeout_secs = self.security.shell_timeout_secs.max(1);
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -196,7 +194,7 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {timeout_secs}s and was killed"
                 )),
             }),
         }
