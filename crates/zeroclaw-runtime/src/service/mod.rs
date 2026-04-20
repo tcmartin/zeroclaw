@@ -7,6 +7,8 @@ use zeroclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
+const DEFAULT_MACOS_SERVICE_PATH: &str =
+    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -619,6 +621,16 @@ fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
     prefix.map(|p| p.join("var").join("zeroclaw"))
 }
 
+fn resolve_macos_service_path(path_from_env: Option<String>) -> String {
+    let candidate = path_from_env.as_deref().map(str::trim).unwrap_or_default();
+
+    if candidate.is_empty() {
+        DEFAULT_MACOS_SERVICE_PATH.to_string()
+    } else {
+        candidate.to_string()
+    }
+}
+
 fn install_macos(config: &Config) -> Result<()> {
     let file = macos_service_file()?;
     if let Some(parent) = file.parent() {
@@ -653,23 +665,38 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
+    let launchd_path = xml_escape(&resolve_macos_service_path(std::env::var("PATH").ok()));
+
+    // Always inject PATH so launchd-started daemons can resolve Homebrew,
+    // Cargo, rbenv and other user-space binaries.
+    // When running under Homebrew, also inject ZEROCLAW_CONFIG_DIR and
     // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
     let env_section = if let Some(ref var_dir) = homebrew_var_dir {
         format!(
             r#"  <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key>
+    <string>{path}</string>
     <key>ZEROCLAW_CONFIG_DIR</key>
     <string>{config_dir}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>{working_dir}</string>
 "#,
+            path = launchd_path,
             config_dir = xml_escape(&var_dir.display().to_string()),
             working_dir = xml_escape(&var_dir.display().to_string()),
         )
     } else {
-        String::new()
+        format!(
+            r#"  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{path}</string>
+  </dict>
+"#,
+            path = launchd_path
+        )
     };
 
     let plist = format!(
@@ -1393,6 +1420,21 @@ mod tests {
     fn xml_escape_escapes_reserved_chars() {
         let escaped = xml_escape("<&>\"' and text");
         assert_eq!(escaped, "&lt;&amp;&gt;&quot;&apos; and text");
+    }
+
+    #[test]
+    fn resolve_macos_service_path_uses_env_path_when_present() {
+        let path = resolve_macos_service_path(Some("/custom/bin:/usr/bin:/bin".to_string()));
+        assert_eq!(path, "/custom/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn resolve_macos_service_path_falls_back_for_missing_or_empty_env() {
+        let missing = resolve_macos_service_path(None);
+        assert_eq!(missing, DEFAULT_MACOS_SERVICE_PATH);
+
+        let empty = resolve_macos_service_path(Some("   ".to_string()));
+        assert_eq!(empty, DEFAULT_MACOS_SERVICE_PATH);
     }
 
     #[cfg(not(target_os = "windows"))]
