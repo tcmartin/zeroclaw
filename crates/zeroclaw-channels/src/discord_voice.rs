@@ -20,17 +20,17 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use zeroclaw_api::channel::ChannelMessage;
 
 const VOICE_REPLY_TARGET_PREFIX: &str = "discord_voice:";
-const DEFAULT_VOICE_SILENCE_MS: u64 = 350;
-const DEFAULT_VOICE_MIN_UTTERANCE_MS: u64 = 240;
+const DEFAULT_VOICE_SILENCE_MS: u64 = 220;
+const DEFAULT_VOICE_MIN_UTTERANCE_MS: u64 = 160;
 const DEFAULT_VOICE_MAX_UTTERANCE_MS: u64 = 12_000;
 const DEFAULT_VOICE_ENERGY_THRESHOLD: f32 = 0.0125;
 const VOICE_TICK_MS: u64 = 20;
 const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_PLAYBACK_SETTLE_MS: u64 = 250;
+const DEFAULT_PLAYBACK_SETTLE_MS: u64 = 80;
 const DEFAULT_JOIN_RETRY_MS: u64 = 5_000;
-const DEFAULT_TRANSCRIPT_COALESCE_MS: u64 = 2_000;
-const FAST_TRANSCRIPT_COALESCE_MS: u64 = 250;
-const FAST_TRANSCRIPT_FLUSH_CHARS: usize = 96;
+const DEFAULT_TRANSCRIPT_COALESCE_MS: u64 = 450;
+const FAST_TRANSCRIPT_COALESCE_MS: u64 = 80;
+const FAST_TRANSCRIPT_FLUSH_CHARS: usize = 32;
 const TARGET_TTS_SAMPLE_RATE: u32 = 48_000;
 const TARGET_TTS_CHANNELS: u16 = 2;
 const VOICE_TICK_SAMPLE_RATE: u32 = 48_000;
@@ -441,13 +441,14 @@ async fn voice_bridge_worker(
                     });
                 });
             }
-            VoiceBridgeCommand::FlushPendingTranscript { user_id, generation } => {
+            VoiceBridgeCommand::FlushPendingTranscript {
+                user_id,
+                generation,
+            } => {
                 let should_flush = pending_transcripts
                     .get(&user_id)
                     .is_some_and(|pending| pending.generation == generation);
-                if should_flush
-                    && let Some(pending) = pending_transcripts.remove(&user_id)
-                {
+                if should_flush && let Some(pending) = pending_transcripts.remove(&user_id) {
                     emit_pending_transcript(user_id, pending, &tx).await;
                 }
             }
@@ -823,7 +824,8 @@ fn append_transcript_fragment(accumulated: &mut String, fragment: &str) {
 }
 
 fn transcript_flush_delay_ms(text: &str) -> u64 {
-    if text.chars().count() >= FAST_TRANSCRIPT_FLUSH_CHARS || transcript_has_terminal_punctuation(text)
+    if text.chars().count() >= FAST_TRANSCRIPT_FLUSH_CHARS
+        || transcript_has_terminal_punctuation(text)
     {
         FAST_TRANSCRIPT_COALESCE_MS
     } else {
@@ -839,10 +841,12 @@ fn transcript_has_terminal_punctuation(text: &str) -> bool {
 }
 
 fn fragment_starts_with_punctuation(fragment: &str) -> bool {
-    fragment
-        .chars()
-        .next()
-        .is_some_and(|ch| matches!(ch, '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：'))
+    fragment.chars().next().is_some_and(|ch| {
+        matches!(
+            ch,
+            '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：'
+        )
+    })
 }
 
 fn wav_bytes_to_voice_ticks(bytes: &[u8]) -> Result<Vec<Vec<i16>>> {
@@ -858,9 +862,8 @@ fn wav_bytes_to_voice_ticks(bytes: &[u8]) -> Result<Vec<Vec<i16>>> {
         .into_iter()
         .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
         .collect();
-    let samples_per_tick =
-        ((VOICE_TICK_SAMPLE_RATE as usize * VOICE_TICK_MS as usize) / 1000)
-            * usize::from(VOICE_TICK_CHANNELS);
+    let samples_per_tick = ((VOICE_TICK_SAMPLE_RATE as usize * VOICE_TICK_MS as usize) / 1000)
+        * usize::from(VOICE_TICK_CHANNELS);
 
     Ok(pcm
         .chunks(samples_per_tick.max(1))
@@ -1210,8 +1213,14 @@ mod tests {
 
     #[test]
     fn transcript_flush_delay_prefers_fast_path_for_long_or_punctuated_text() {
-        assert_eq!(transcript_flush_delay_ms("short fragment"), DEFAULT_TRANSCRIPT_COALESCE_MS);
-        assert_eq!(transcript_flush_delay_ms("done."), FAST_TRANSCRIPT_COALESCE_MS);
+        assert_eq!(
+            transcript_flush_delay_ms("short fragment"),
+            DEFAULT_TRANSCRIPT_COALESCE_MS
+        );
+        assert_eq!(
+            transcript_flush_delay_ms("done."),
+            FAST_TRANSCRIPT_COALESCE_MS
+        );
         assert_eq!(
             transcript_flush_delay_ms(&"x".repeat(FAST_TRANSCRIPT_FLUSH_CHARS)),
             FAST_TRANSCRIPT_COALESCE_MS

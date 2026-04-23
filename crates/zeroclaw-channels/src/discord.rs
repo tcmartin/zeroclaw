@@ -11,8 +11,9 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
-const VOICE_STREAM_MIN_SENTENCE_CHARS: usize = 24;
-const VOICE_STREAM_SOFT_BREAK_CHARS: usize = 72;
+const VOICE_STREAM_MIN_SENTENCE_CHARS: usize = 12;
+const VOICE_STREAM_SOFT_BREAK_CHARS: usize = 36;
+const VOICE_STREAM_EARLY_BREAK_CHARS: usize = 24;
 
 enum VoiceReplyStreamCommand {
     Speak(String),
@@ -1001,6 +1002,7 @@ fn next_streamable_voice_boundary(accumulated_text: &str, streamed_len: usize) -
     let pending = &accumulated_text[start..];
     let mut char_count = 0usize;
     let mut soft_boundary = None;
+    let mut whitespace_boundary = None;
 
     for (offset, ch) in pending.char_indices() {
         char_count += 1;
@@ -1016,9 +1018,15 @@ fn next_streamable_voice_boundary(accumulated_text: &str, streamed_len: usize) -
         {
             soft_boundary = Some(boundary);
         }
+        if ch.is_whitespace()
+            && char_count >= VOICE_STREAM_EARLY_BREAK_CHARS
+            && whitespace_boundary.is_none()
+        {
+            whitespace_boundary = Some(boundary);
+        }
     }
 
-    soft_boundary
+    soft_boundary.or(whitespace_boundary)
 }
 
 /// Split a message into multiple logical chunks at paragraph boundaries for
@@ -2590,8 +2598,11 @@ mod tests {
             &mut streamed_len,
             false,
         );
-        assert_eq!(segments, vec!["This is the first streamed sentence."]);
-        assert_eq!(streamed_len, "This is the first streamed sentence.".len());
+        assert_eq!(segments.first().map(String::as_str), Some("This is the first streamed sentence."));
+        assert!(
+            streamed_len >= "This is the first streamed sentence.".len(),
+            "streamed_len should advance past the first complete sentence"
+        );
     }
 
     #[test]
@@ -2600,14 +2611,26 @@ mod tests {
         let text = "This clause keeps going for quite a while without terminal punctuation or any kind of final stop, but it does reach a useful pause for speech";
         let segments = drain_streamable_voice_segments(text, &mut streamed_len, false);
         assert_eq!(
-            segments,
-            vec![
+            segments.first().map(String::as_str),
+            Some(
                 "This clause keeps going for quite a while without terminal punctuation or any kind of final stop,"
-            ]
+            )
         );
-        assert_eq!(
-            streamed_len,
-            "This clause keeps going for quite a while without terminal punctuation or any kind of final stop,".len()
+        assert!(
+            streamed_len >= segments.concat().len(),
+            "streamed_len should account for consumed whitespace between emitted segments"
+        );
+    }
+
+    #[test]
+    fn drain_streamable_voice_segments_can_start_on_whitespace_before_punctuation() {
+        let mut streamed_len = 0;
+        let text = "This starts speaking earlier even before a sentence ends so the reply can feel realtime";
+        let segments = drain_streamable_voice_segments(text, &mut streamed_len, false);
+        assert_eq!(segments.first().map(String::as_str), Some("This starts speaking earlier"));
+        assert!(
+            streamed_len >= segments.concat().len(),
+            "streamed_len should account for consumed whitespace between emitted segments"
         );
     }
 

@@ -671,6 +671,16 @@ fn build_channel_system_prompt(
         prompt.push_str(&context);
     }
 
+    if channel_name == "discord" && reply_target.starts_with("discord_voice:") {
+        prompt.push_str(
+            "\n\nRealtime voice mode: The user is speaking to you in a Discord voice channel. \
+             Prioritize low-latency spoken conversation. Reply in short, speakable sentences. \
+             Start with the answer immediately. Avoid bullet lists, markdown, long preambles, \
+             and unnecessary tool use. Only use tools when the user explicitly asks for an \
+             action or lookup that requires them.",
+        );
+    }
+
     prompt
 }
 
@@ -12106,5 +12116,17 @@ This is an example JSON object for profile settings."#;
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_adds_realtime_voice_guidance_for_discord_voice_targets() {
+        let prompt = build_channel_system_prompt(
+            "Base.",
+            "discord",
+            "discord_voice:1:2",
+            "user_aaa",
+        );
+        assert!(prompt.contains("Realtime voice mode:"));
+        assert!(prompt.contains("Prioritize low-latency spoken conversation."));
     }
 }
