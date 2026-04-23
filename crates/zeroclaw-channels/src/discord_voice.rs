@@ -3,12 +3,15 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;
 use songbird::{
-    CoreEvent, Event, EventContext, EventHandler,
+    CoreEvent, Event, EventContext, EventHandler, TrackEvent,
     driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
-    input::{Input, RawAdapter},
+    input::{
+        File as SongbirdFile, Input,
+        codecs::{get_codec_registry, get_probe},
+    },
+    tracks::PlayMode,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -17,13 +20,18 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use zeroclaw_api::channel::ChannelMessage;
 
 const VOICE_REPLY_TARGET_PREFIX: &str = "discord_voice:";
-const DEFAULT_VOICE_SILENCE_MS: u64 = 1200;
-const DEFAULT_VOICE_MIN_UTTERANCE_MS: u64 = 400;
+const DEFAULT_VOICE_SILENCE_MS: u64 = 350;
+const DEFAULT_VOICE_MIN_UTTERANCE_MS: u64 = 240;
 const DEFAULT_VOICE_MAX_UTTERANCE_MS: u64 = 12_000;
 const DEFAULT_VOICE_ENERGY_THRESHOLD: f32 = 0.0125;
 const VOICE_TICK_MS: u64 = 20;
 const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLAYBACK_SETTLE_MS: u64 = 250;
+const DEFAULT_JOIN_RETRY_MS: u64 = 5_000;
+const TARGET_TTS_SAMPLE_RATE: u32 = 48_000;
+const TARGET_TTS_CHANNELS: u16 = 2;
+const VOICE_TICK_SAMPLE_RATE: u32 = 48_000;
+const VOICE_TICK_CHANNELS: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct DiscordVoiceBridge {
@@ -42,6 +50,7 @@ struct DiscordVoiceBridgeState {
     command_tx: Mutex<Option<mpsc::UnboundedSender<VoiceBridgeCommand>>>,
     running: AtomicBool,
     joined: AtomicBool,
+    joining: AtomicBool,
     silence_ms: u64,
     min_utterance_ms: u64,
     max_utterance_ms: u64,
@@ -141,6 +150,7 @@ impl DiscordVoiceBridge {
                 command_tx: Mutex::new(None),
                 running: AtomicBool::new(false),
                 joined: AtomicBool::new(false),
+                joining: AtomicBool::new(false),
                 silence_ms: DEFAULT_VOICE_SILENCE_MS,
                 min_utterance_ms: DEFAULT_VOICE_MIN_UTTERANCE_MS,
                 max_utterance_ms: DEFAULT_VOICE_MAX_UTTERANCE_MS,
@@ -200,6 +210,7 @@ impl DiscordVoiceBridge {
             }
             state.running.store(false, Ordering::SeqCst);
             state.joined.store(false, Ordering::SeqCst);
+            state.joining.store(false, Ordering::SeqCst);
             *state.command_tx.lock() = None;
             *state.runtime.lock() = None;
         });
@@ -238,6 +249,43 @@ impl DiscordVoiceBridge {
         )
         .await;
         Ok(true)
+    }
+
+    pub async fn simulate_wav_utterance(&self, user_id: u64, wav: &[u8]) -> Result<()> {
+        let sender = self
+            .command_sender()
+            .await
+            .context("Discord voice bridge is not running")?;
+        let pcm_ticks = wav_bytes_to_voice_ticks(wav)?;
+        let ssrc = 0x5A5A_0000u32 ^ (user_id as u32);
+        sender
+            .send(VoiceBridgeCommand::Speaking { user_id, ssrc })
+            .context("Discord voice bridge command channel closed")?;
+
+        for chunk in pcm_ticks {
+            sender
+                .send(VoiceBridgeCommand::VoiceTick {
+                    speaking: vec![(ssrc, chunk)],
+                })
+                .context("Discord voice bridge command channel closed")?;
+            tokio::time::sleep(std::time::Duration::from_millis(VOICE_TICK_MS)).await;
+        }
+
+        let silence_ticks = self
+            .state
+            .silence_ms
+            .saturating_div(VOICE_TICK_MS)
+            .saturating_add(2);
+        for _ in 0..silence_ticks {
+            sender
+                .send(VoiceBridgeCommand::VoiceTick {
+                    speaking: vec![(ssrc, Vec::new())],
+                })
+                .context("Discord voice bridge command channel closed")?;
+            tokio::time::sleep(std::time::Duration::from_millis(VOICE_TICK_MS)).await;
+        }
+
+        Ok(())
     }
 
     async fn command_sender(&self) -> Option<mpsc::UnboundedSender<VoiceBridgeCommand>> {
@@ -373,9 +421,30 @@ async fn voice_bridge_worker(
                     }
                 };
                 let playback_duration = wav_duration(&wav)?;
-                let input = wav_bytes_to_songbird_input(&wav)?;
+                let input = match wav_bytes_to_songbird_input(&wav).await {
+                    Ok(input) => input,
+                    Err(err) => {
+                        let _ = ack.send(Err(format!("failed to prepare voice playback: {err}")));
+                        tracing::warn!(
+                            "Discord voice bridge failed to prepare playback input: {err}"
+                        );
+                        continue;
+                    }
+                };
                 let mut call = call.lock().await;
-                call.play_only_input(input);
+                let handle = call.play_only_input(input);
+                let _ = handle.add_event(
+                    Event::Track(TrackEvent::Playable),
+                    DiscordVoicePlaybackLogger { label: "playable" },
+                );
+                let _ = handle.add_event(
+                    Event::Track(TrackEvent::End),
+                    DiscordVoicePlaybackLogger { label: "ended" },
+                );
+                let _ = handle.add_event(
+                    Event::Track(TrackEvent::Error),
+                    DiscordVoicePlaybackLogger { label: "errored" },
+                );
                 let _ = ack.send(Ok(playback_duration));
                 tracing::info!("Discord voice bridge played reply into voice channel");
             }
@@ -477,6 +546,77 @@ struct DiscordVoiceGatewayHandler {
     command_tx: mpsc::UnboundedSender<VoiceBridgeCommand>,
 }
 
+async fn attempt_join_voice_channel(
+    manager: Arc<songbird::Songbird>,
+    state: Arc<DiscordVoiceBridgeState>,
+    command_tx: mpsc::UnboundedSender<VoiceBridgeCommand>,
+) {
+    let guild_id = match state.guild_id.parse::<u64>() {
+        Ok(id) => serenity::all::GuildId::new(id),
+        Err(err) => {
+            tracing::warn!("Discord voice bridge invalid guild_id: {err}");
+            state.joining.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+    let channel_id = match state.channel_id.parse::<u64>() {
+        Ok(id) => serenity::all::ChannelId::new(id),
+        Err(err) => {
+            tracing::warn!("Discord voice bridge invalid channel_id: {err}");
+            state.joining.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+
+    loop {
+        if !state.running.load(Ordering::SeqCst) {
+            state.joining.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        match manager.join(guild_id, channel_id).await {
+            Ok(call) => {
+                let mut handler = call.lock().await;
+                handler.add_global_event(
+                    Event::Core(CoreEvent::SpeakingStateUpdate),
+                    DiscordVoiceSongbirdHandler {
+                        command_tx: command_tx.clone(),
+                    },
+                );
+                handler.add_global_event(
+                    Event::Core(CoreEvent::VoiceTick),
+                    DiscordVoiceSongbirdHandler {
+                        command_tx: command_tx.clone(),
+                    },
+                );
+                handler.add_global_event(
+                    Event::Core(CoreEvent::ClientDisconnect),
+                    DiscordVoiceSongbirdHandler {
+                        command_tx: command_tx.clone(),
+                    },
+                );
+                let _ = command_tx.send(VoiceBridgeCommand::JoinReady { call: call.clone() });
+                state.joined.store(true, Ordering::SeqCst);
+                state.joining.store(false, Ordering::SeqCst);
+                tracing::info!(
+                    guild_id = %state.guild_id,
+                    channel_id = %state.channel_id,
+                    "Discord voice bridge joined configured voice channel"
+                );
+                return;
+            }
+            Err(err) => {
+                state.joined.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    retry_ms = DEFAULT_JOIN_RETRY_MS,
+                    "Discord voice bridge failed to join voice channel: {err}; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(DEFAULT_JOIN_RETRY_MS)).await;
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl serenity::all::EventHandler for DiscordVoiceGatewayHandler {
     async fn ready(&self, ctx: serenity::all::Context, _ready: serenity::all::Ready) {
@@ -485,60 +625,31 @@ impl serenity::all::EventHandler for DiscordVoiceGatewayHandler {
             return;
         };
 
-        let guild_id = match self.state.guild_id.parse::<u64>() {
-            Ok(id) => serenity::all::GuildId::new(id),
-            Err(err) => {
-                tracing::warn!("Discord voice bridge invalid guild_id: {err}");
-                return;
-            }
-        };
-        let channel_id = match self.state.channel_id.parse::<u64>() {
-            Ok(id) => serenity::all::ChannelId::new(id),
-            Err(err) => {
-                tracing::warn!("Discord voice bridge invalid channel_id: {err}");
-                return;
-            }
-        };
-
-        match manager.join(guild_id, channel_id).await {
-            Ok(call) => {
-                let mut handler = call.lock().await;
-                handler.add_global_event(
-                    Event::Core(CoreEvent::SpeakingStateUpdate),
-                    DiscordVoiceSongbirdHandler {
-                        command_tx: self.command_tx.clone(),
-                    },
-                );
-                handler.add_global_event(
-                    Event::Core(CoreEvent::VoiceTick),
-                    DiscordVoiceSongbirdHandler {
-                        command_tx: self.command_tx.clone(),
-                    },
-                );
-                handler.add_global_event(
-                    Event::Core(CoreEvent::ClientDisconnect),
-                    DiscordVoiceSongbirdHandler {
-                        command_tx: self.command_tx.clone(),
-                    },
-                );
-                let _ = self
-                    .command_tx
-                    .send(VoiceBridgeCommand::JoinReady { call: call.clone() });
-                tracing::info!(
-                    guild_id = %self.state.guild_id,
-                    channel_id = %self.state.channel_id,
-                    "Discord voice bridge joined configured voice channel"
-                );
-            }
-            Err(err) => {
-                tracing::warn!("Discord voice bridge failed to join voice channel: {err}");
-            }
+        self.state.joined.store(false, Ordering::SeqCst);
+        if self
+            .state
+            .joining
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("Discord voice bridge join already in progress");
+            return;
         }
+
+        tokio::spawn(attempt_join_voice_channel(
+            manager,
+            self.state.clone(),
+            self.command_tx.clone(),
+        ));
     }
 }
 
 struct DiscordVoiceSongbirdHandler {
     command_tx: mpsc::UnboundedSender<VoiceBridgeCommand>,
+}
+
+struct DiscordVoicePlaybackLogger {
+    label: &'static str,
 }
 
 #[async_trait]
@@ -579,6 +690,34 @@ impl EventHandler for DiscordVoiceSongbirdHandler {
     }
 }
 
+#[async_trait]
+impl EventHandler for DiscordVoicePlaybackLogger {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::Track(states) = ctx {
+            if let Some((state, _)) = states.first() {
+                match &state.playing {
+                    PlayMode::Errored(err) => tracing::warn!(
+                        label = self.label,
+                        ready = ?state.ready,
+                        position_ms = state.position.as_millis(),
+                        play_time_ms = state.play_time.as_millis(),
+                        "Discord voice playback track error: {err}"
+                    ),
+                    mode => tracing::info!(
+                        label = self.label,
+                        playing = ?mode,
+                        ready = ?state.ready,
+                        position_ms = state.position.as_millis(),
+                        play_time_ms = state.play_time.as_millis(),
+                        "Discord voice playback track event"
+                    ),
+                }
+            }
+        }
+        None
+    }
+}
+
 fn is_voice_user_allowed(allowed_users: &HashSet<String>, user_id: u64) -> bool {
     let user_id = user_id.to_string();
     allowed_users.contains("*") || allowed_users.contains(&user_id)
@@ -594,6 +733,29 @@ fn should_flush_buffer(
     let silence_met = buffer.silence_ms() >= silence_ms;
     let max_duration_met = buffer.duration_ms() >= max_utterance_ms;
     !buffer.samples.is_empty() && min_duration_met && (silence_met || max_duration_met)
+}
+
+fn wav_bytes_to_voice_ticks(bytes: &[u8]) -> Result<Vec<Vec<i16>>> {
+    let parsed = parse_wav_pcm(bytes)?;
+    let normalized = normalize_songbird_playback_pcm(
+        parsed.samples,
+        parsed.sample_rate,
+        parsed.channels,
+        VOICE_TICK_SAMPLE_RATE,
+        VOICE_TICK_CHANNELS,
+    );
+    let pcm: Vec<i16> = normalized
+        .into_iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+    let samples_per_tick =
+        ((VOICE_TICK_SAMPLE_RATE as usize * VOICE_TICK_MS as usize) / 1000)
+            * usize::from(VOICE_TICK_CHANNELS);
+
+    Ok(pcm
+        .chunks(samples_per_tick.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect())
 }
 
 fn compute_rms_energy(samples: &[f32]) -> f32 {
@@ -644,18 +806,107 @@ fn ensure_wav_audio(bytes: &[u8]) -> Result<Vec<u8>> {
     bail!("audio payload is not WAV; set [tts].default_format = \"wav\"")
 }
 
-fn wav_bytes_to_songbird_input(bytes: &[u8]) -> Result<Input> {
+async fn wav_bytes_to_songbird_input(bytes: &[u8]) -> Result<Input> {
     let parsed = parse_wav_pcm(bytes)?;
-    let mut pcm = Vec::with_capacity(parsed.samples.len() * std::mem::size_of::<f32>());
-    for sample in parsed.samples {
-        pcm.extend_from_slice(&sample.to_le_bytes());
-    }
-    let cursor = Cursor::new(pcm);
-    Ok(Input::from(RawAdapter::new(
-        cursor,
+    let normalized = normalize_songbird_playback_pcm(
+        parsed.samples,
         parsed.sample_rate,
-        u32::from(parsed.channels),
-    )))
+        parsed.channels,
+        TARGET_TTS_SAMPLE_RATE,
+        TARGET_TTS_CHANNELS,
+    );
+    let wav = encode_wav_from_f32(&normalized, TARGET_TTS_SAMPLE_RATE, TARGET_TTS_CHANNELS);
+    let path = std::env::temp_dir().join(format!(
+        "zeroclaw-discord-voice-{}.wav",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, &wav).context("failed to write temp WAV for Discord voice playback")?;
+    let input = Input::from(SongbirdFile::new(path.clone()))
+        .make_playable_async(get_codec_registry(), get_probe())
+        .await;
+    let _ = std::fs::remove_file(&path);
+    input.context("Songbird could not promote WAV playback input")
+}
+
+fn normalize_songbird_playback_pcm(
+    samples: Vec<f32>,
+    source_rate: u32,
+    source_channels: u16,
+    target_rate: u32,
+    target_channels: u16,
+) -> Vec<f32> {
+    let original = samples.clone();
+    let channelized = match source_channels {
+        1 => vec![samples],
+        2 => {
+            let mut left = Vec::with_capacity(samples.len() / 2);
+            let mut right = Vec::with_capacity(samples.len() / 2);
+            for frame in samples.chunks_exact(2) {
+                left.push(frame[0]);
+                right.push(frame[1]);
+            }
+            vec![left, right]
+        }
+        _ => return samples,
+    };
+
+    let resampled = if source_rate == target_rate {
+        channelized
+    } else {
+        channelized
+            .into_iter()
+            .map(|channel| resample_linear_channel(&channel, source_rate, target_rate))
+            .collect::<Vec<_>>()
+    };
+
+    let expanded = match (resampled.as_slice(), target_channels) {
+        ([mono], 1) => vec![mono.clone()],
+        ([mono], 2) => vec![mono.clone(), mono.clone()],
+        ([left, right], 1) => vec![
+            left.iter()
+                .zip(right.iter())
+                .map(|(l, r)| (l + r) * 0.5)
+                .collect(),
+        ],
+        ([left, right], 2) => vec![left.clone(), right.clone()],
+        _ => return original,
+    };
+
+    interleave_channels(&expanded)
+}
+
+fn resample_linear_channel(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 || source_rate == target_rate {
+        return samples.to_vec();
+    }
+
+    let target_len =
+        ((samples.len() as u64 * u64::from(target_rate)) / u64::from(source_rate)).max(1) as usize;
+    let scale = source_rate as f64 / target_rate as f64;
+    let mut out = Vec::with_capacity(target_len);
+
+    for idx in 0..target_len {
+        let src_pos = idx as f64 * scale;
+        let left_idx = src_pos.floor() as usize;
+        let right_idx = (left_idx + 1).min(samples.len().saturating_sub(1));
+        let frac = (src_pos - left_idx as f64) as f32;
+        let left = samples[left_idx];
+        let right = samples[right_idx];
+        out.push(left + (right - left) * frac);
+    }
+
+    out
+}
+
+fn interleave_channels(channels: &[Vec<f32>]) -> Vec<f32> {
+    let frame_count = channels.first().map_or(0, Vec::len);
+    let mut pcm = Vec::with_capacity(frame_count * channels.len());
+    for frame_idx in 0..frame_count {
+        for channel in channels {
+            pcm.push(channel.get(frame_idx).copied().unwrap_or(0.0));
+        }
+    }
+    pcm
 }
 
 fn wav_duration(bytes: &[u8]) -> Result<std::time::Duration> {
@@ -819,5 +1070,30 @@ mod tests {
         let wav = encode_wav_from_f32(&vec![0.0; 24_000], 24_000, 1);
         let duration = wav_duration(&wav).unwrap();
         assert_eq!(duration.as_secs_f64(), 1.0);
+    }
+
+    #[test]
+    fn normalize_songbird_playback_pcm_upsamples_and_stereoizes() {
+        let normalized =
+            normalize_songbird_playback_pcm(vec![0.0, 0.5, -0.5, 1.0], 24_000, 1, 48_000, 2);
+        assert_eq!(normalized.len(), 16);
+        for frame in normalized.chunks_exact(2) {
+            assert!((frame[0] - frame[1]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn wav_bytes_to_voice_ticks_normalizes_to_20ms_stereo_chunks() {
+        let wav = encode_wav_from_f32(&vec![0.25; 24_000], 24_000, 1);
+        let ticks = wav_bytes_to_voice_ticks(&wav).unwrap();
+        assert_eq!(ticks.len(), 50);
+        assert!(ticks.iter().all(|chunk| chunk.len() == 1920));
+    }
+
+    #[tokio::test]
+    async fn wav_bytes_to_songbird_input_promotes_raw_adapter() {
+        let wav = encode_wav_from_f32(&vec![0.0; 24_000], 24_000, 1);
+        let input = wav_bytes_to_songbird_input(&wav).await.unwrap();
+        assert!(input.is_playable());
     }
 }
