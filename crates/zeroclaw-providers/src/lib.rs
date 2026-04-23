@@ -52,6 +52,8 @@ use std::path::PathBuf;
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+const MINIMAX_ANTHROPIC_INTL_BASE_URL: &str = "https://api.minimax.io/anthropic";
+const MINIMAX_ANTHROPIC_CN_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
 const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
 const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
@@ -105,8 +107,29 @@ pub fn is_minimax_cn_alias(name: &str) -> bool {
     )
 }
 
+pub fn is_minimax_anthropic_intl_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "minimax-anthropic"
+            | "minimax-anthropic-intl"
+            | "minimax-claude"
+            | "minimax-native"
+            | "minimax-native-intl"
+    )
+}
+
+pub fn is_minimax_anthropic_cn_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "minimax-anthropic-cn" | "minimax-claude-cn" | "minimax-native-cn"
+    )
+}
+
 pub fn is_minimax_alias(name: &str) -> bool {
-    is_minimax_intl_alias(name) || is_minimax_cn_alias(name)
+    is_minimax_intl_alias(name)
+        || is_minimax_cn_alias(name)
+        || is_minimax_anthropic_intl_alias(name)
+        || is_minimax_anthropic_cn_alias(name)
 }
 
 pub fn is_glm_global_alias(name: &str) -> bool {
@@ -643,6 +666,16 @@ fn minimax_base_url(name: &str) -> Option<&'static str> {
         Some(MINIMAX_CN_BASE_URL)
     } else if is_minimax_intl_alias(name) {
         Some(MINIMAX_INTL_BASE_URL)
+    } else {
+        None
+    }
+}
+
+fn minimax_anthropic_base_url(name: &str) -> Option<&'static str> {
+    if is_minimax_anthropic_cn_alias(name) {
+        Some(MINIMAX_ANTHROPIC_CN_BASE_URL)
+    } else if is_minimax_anthropic_intl_alias(name) {
+        Some(MINIMAX_ANTHROPIC_INTL_BASE_URL)
     } else {
         None
     }
@@ -1333,6 +1366,16 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             ),
         )),
+        name if minimax_anthropic_base_url(name).is_some() => {
+            let mut p = anthropic::AnthropicProvider::with_base_url(
+                key,
+                minimax_anthropic_base_url(name),
+            );
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(mt);
+            }
+            Ok(Box::new(p))
+        }
         "azure_openai" | "azure-openai" | "azure" => {
             let resource = std::env::var("AZURE_OPENAI_RESOURCE")
                 .unwrap_or_else(|_| "my-resource".to_string());
@@ -1815,7 +1858,12 @@ pub fn create_resilient_provider_with_options(
         "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, primary_credential, options)?
         }
-        _ => create_provider_with_url_and_options(primary_name, primary_credential, api_url, options)?,
+        _ => create_provider_with_url_and_options(
+            primary_name,
+            primary_credential,
+            api_url,
+            options,
+        )?,
     };
     providers.push((primary_name.to_string(), primary_provider));
 
@@ -2162,6 +2210,20 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "minimax-oauth-cn",
                 "minimax-portal",
                 "minimax-portal-cn",
+            ],
+            local: false,
+        },
+        ProviderInfo {
+            name: "minimax-anthropic",
+            display_name: "MiniMax (Anthropic API)",
+            aliases: &[
+                "minimax-anthropic-intl",
+                "minimax-claude",
+                "minimax-native",
+                "minimax-native-intl",
+                "minimax-anthropic-cn",
+                "minimax-claude-cn",
+                "minimax-native-cn",
             ],
             local: false,
         },
@@ -2932,6 +2994,15 @@ mod tests {
     }
 
     #[test]
+    fn factory_minimax_anthropic() {
+        assert!(create_provider("minimax-anthropic", Some("key")).is_ok());
+        assert!(create_provider("minimax-native", Some("key")).is_ok());
+        assert!(create_provider("minimax-claude", Some("key")).is_ok());
+        assert!(create_provider("minimax-anthropic-cn", Some("key")).is_ok());
+        assert!(create_provider("minimax-native-cn", Some("key")).is_ok());
+    }
+
+    #[test]
     fn factory_minimax_disables_native_tool_calling() {
         let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
         assert!(!minimax.supports_native_tools());
@@ -2939,6 +3010,13 @@ mod tests {
         let minimax_cn =
             create_provider("minimax-cn", Some("key")).expect("provider should resolve");
         assert!(!minimax_cn.supports_native_tools());
+    }
+
+    #[test]
+    fn factory_minimax_anthropic_keeps_native_tool_calling() {
+        let minimax =
+            create_provider("minimax-anthropic", Some("key")).expect("provider should resolve");
+        assert!(minimax.supports_native_tools());
     }
 
     #[test]
@@ -4010,16 +4088,14 @@ mod tests {
         let mut keys = std::collections::HashMap::new();
         keys.insert("zai".to_string(), "zai-profile-key".to_string());
 
-        let resolved =
-            effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
+        let resolved = effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
         assert_eq!(resolved, Some("zai-profile-key"));
     }
 
     #[test]
     fn effective_primary_provider_credential_falls_back_when_profile_missing() {
         let keys = std::collections::HashMap::new();
-        let resolved =
-            effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
+        let resolved = effective_primary_provider_credential("zai", Some("fallback-key"), &keys);
         assert_eq!(resolved, Some("fallback-key"));
     }
 }
