@@ -11572,6 +11572,7 @@ This is an example JSON object for profile settings."#;
             piper: Some(zeroclaw_config::schema::PiperTtsConfig {
                 api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
             }),
+            minimax: None,
         };
         config.transcription = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,

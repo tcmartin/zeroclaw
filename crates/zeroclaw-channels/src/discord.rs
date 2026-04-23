@@ -286,9 +286,9 @@ impl DiscordChannel {
         };
 
         for segment in segments {
-            sender.send(VoiceReplyStreamCommand::Speak(segment)).map_err(|_| {
-                anyhow::anyhow!("Discord voice stream queue closed unexpectedly")
-            })?;
+            sender
+                .send(VoiceReplyStreamCommand::Speak(segment))
+                .map_err(|_| anyhow::anyhow!("Discord voice stream queue closed unexpectedly"))?;
         }
 
         if finalize {
@@ -2303,6 +2303,7 @@ mod tests {
                 piper: Some(zeroclaw_config::schema::PiperTtsConfig {
                     api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
                 }),
+                minimax: None,
             },
         );
 
@@ -2334,6 +2335,7 @@ mod tests {
                 piper: Some(zeroclaw_config::schema::PiperTtsConfig {
                     api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
                 }),
+                minimax: None,
             },
         );
 
@@ -2599,7 +2601,9 @@ mod tests {
         let segments = drain_streamable_voice_segments(text, &mut streamed_len, false);
         assert_eq!(
             segments,
-            vec!["This clause keeps going for quite a while without terminal punctuation or any kind of final stop,"]
+            vec![
+                "This clause keeps going for quite a while without terminal punctuation or any kind of final stop,"
+            ]
         );
         assert_eq!(
             streamed_len,

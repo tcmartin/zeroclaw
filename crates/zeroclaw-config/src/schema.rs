@@ -1122,6 +1122,42 @@ fn default_piper_tts_api_url() -> String {
     "http://127.0.0.1:5000/v1/audio/speech".into()
 }
 
+fn default_minimax_tts_websocket_url() -> String {
+    "wss://api.minimax.io/ws/v1/t2a_v2".into()
+}
+
+fn default_minimax_tts_model() -> String {
+    "speech-2.8-turbo".into()
+}
+
+fn default_minimax_tts_language_boost() -> String {
+    "auto".into()
+}
+
+fn default_minimax_tts_speed() -> f64 {
+    1.0
+}
+
+fn default_minimax_tts_volume() -> f64 {
+    1.0
+}
+
+fn default_minimax_tts_pitch() -> f64 {
+    0.0
+}
+
+fn default_minimax_tts_sample_rate() -> u32 {
+    32_000
+}
+
+fn default_minimax_tts_bitrate() -> u32 {
+    128_000
+}
+
+fn default_minimax_tts_channel() -> u8 {
+    1
+}
+
 /// Text-to-Speech configuration (`[tts]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1130,7 +1166,7 @@ pub struct TtsConfig {
     /// Enable TTS synthesis.
     #[serde(default)]
     pub enabled: bool,
-    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`).
+    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`, `"piper"`, `"minimax"`).
     #[serde(default = "default_tts_provider")]
     pub default_provider: String,
     /// Default voice ID passed to the selected provider.
@@ -1162,6 +1198,10 @@ pub struct TtsConfig {
     #[serde(default)]
     #[nested]
     pub piper: Option<PiperTtsConfig>,
+    /// MiniMax WebSocket TTS provider configuration (`[tts.minimax]`).
+    #[serde(default)]
+    #[nested]
+    pub minimax: Option<MiniMaxTtsConfig>,
 }
 
 impl Default for TtsConfig {
@@ -1177,6 +1217,7 @@ impl Default for TtsConfig {
             google: None,
             edge: None,
             piper: None,
+            minimax: None,
         }
     }
 }
@@ -1264,6 +1305,61 @@ impl Default for PiperTtsConfig {
     fn default() -> Self {
         Self {
             api_url: default_piper_tts_api_url(),
+        }
+    }
+}
+
+/// MiniMax TTS provider configuration (WebSocket streaming synthesis).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "tts.minimax"]
+pub struct MiniMaxTtsConfig {
+    /// API key for MiniMax TTS.
+    #[serde(default)]
+    #[secret]
+    pub api_key: Option<String>,
+    /// WebSocket endpoint for streaming synthesis.
+    #[serde(default = "default_minimax_tts_websocket_url")]
+    pub websocket_url: String,
+    /// Model name (default `"speech-2.8-turbo"`).
+    #[serde(default = "default_minimax_tts_model")]
+    pub model: String,
+    /// Language boost hint (`"auto"`, `"Chinese"`, etc.).
+    #[serde(default = "default_minimax_tts_language_boost")]
+    pub language_boost: String,
+    /// Voice speed multiplier.
+    #[serde(default = "default_minimax_tts_speed")]
+    pub speed: f64,
+    /// Volume multiplier.
+    #[serde(default = "default_minimax_tts_volume")]
+    pub volume: f64,
+    /// Voice pitch shift.
+    #[serde(default = "default_minimax_tts_pitch")]
+    pub pitch: f64,
+    /// Output sample rate.
+    #[serde(default = "default_minimax_tts_sample_rate")]
+    pub sample_rate: u32,
+    /// Output bitrate.
+    #[serde(default = "default_minimax_tts_bitrate")]
+    pub bitrate: u32,
+    /// Output channel count.
+    #[serde(default = "default_minimax_tts_channel")]
+    pub channel: u8,
+}
+
+impl Default for MiniMaxTtsConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            websocket_url: default_minimax_tts_websocket_url(),
+            model: default_minimax_tts_model(),
+            language_boost: default_minimax_tts_language_boost(),
+            speed: default_minimax_tts_speed(),
+            volume: default_minimax_tts_volume(),
+            pitch: default_minimax_tts_pitch(),
+            sample_rate: default_minimax_tts_sample_rate(),
+            bitrate: default_minimax_tts_bitrate(),
+            channel: default_minimax_tts_channel(),
         }
     }
 }

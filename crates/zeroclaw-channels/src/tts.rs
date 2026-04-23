@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 
 use zeroclaw_config::schema::TtsConfig;
 
@@ -534,6 +536,288 @@ impl TtsProvider for PiperTtsProvider {
     }
 }
 
+// ── MiniMax WebSocket TTS ───────────────────────────────────────
+
+/// MiniMax TTS provider using the documented WebSocket streaming API.
+pub struct MiniMaxWsTtsProvider {
+    api_key: String,
+    websocket_url: String,
+    model: String,
+    language_boost: String,
+    speed: f64,
+    volume: f64,
+    pitch: f64,
+    sample_rate: u32,
+    bitrate: u32,
+    channel: u8,
+    output_format: String,
+}
+
+impl MiniMaxWsTtsProvider {
+    fn json_number(value: f64) -> serde_json::Value {
+        if value.is_finite() && value.fract() == 0.0 {
+            serde_json::Value::Number(serde_json::Number::from(value as i64))
+        } else if let Some(number) = serde_json::Number::from_f64(value) {
+            serde_json::Value::Number(number)
+        } else {
+            serde_json::Value::Number(serde_json::Number::from(0))
+        }
+    }
+
+    pub fn new(
+        config: &zeroclaw_config::schema::MiniMaxTtsConfig,
+        output_format: &str,
+    ) -> Result<Self> {
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                std::env::var("MINIMAX_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context("Missing MiniMax TTS API key: set [tts.minimax].api_key or MINIMAX_API_KEY")?;
+
+        let output_format = output_format.trim().to_ascii_lowercase();
+        if output_format == "wav" {
+            bail!(
+                "MiniMax WebSocket TTS does not support wav streaming output; use mp3, pcm, or flac"
+            );
+        }
+
+        Ok(Self {
+            api_key,
+            websocket_url: config.websocket_url.trim().to_string(),
+            model: config.model.trim().to_string(),
+            language_boost: config.language_boost.trim().to_string(),
+            speed: config.speed,
+            volume: config.volume,
+            pitch: config.pitch,
+            sample_rate: config.sample_rate,
+            bitrate: config.bitrate,
+            channel: config.channel,
+            output_format,
+        })
+    }
+
+    fn task_start_payload(&self, voice: &str) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "event": "task_start",
+            "model": self.model,
+            "voice_setting": {
+                "voice_id": voice,
+                "speed": Self::json_number(self.speed),
+                "vol": Self::json_number(self.volume),
+                "pitch": Self::json_number(self.pitch),
+            },
+            "audio_setting": {
+                "sample_rate": self.sample_rate,
+                "bitrate": self.bitrate,
+                "format": self.output_format,
+                "channel": self.channel,
+            }
+        });
+        if !self.language_boost.is_empty() && !self.language_boost.eq_ignore_ascii_case("auto") {
+            payload["language_boost"] = serde_json::Value::String(self.language_boost.clone());
+        }
+        payload
+    }
+
+    fn extract_status_msg(payload: &serde_json::Value) -> Option<String> {
+        payload
+            .get("base_resp")
+            .and_then(|base| base.get("status_msg"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                payload
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for MiniMaxWsTtsProvider {
+    fn name(&self) -> &str {
+        "minimax"
+    }
+
+    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+        let auth_header = format!("Bearer {}", self.api_key);
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let mut request = self
+            .websocket_url
+            .as_str()
+            .into_client_request()
+            .context("Failed to build MiniMax TTS WebSocket request")?;
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&auth_header)
+                .context("MiniMax TTS Authorization header is invalid")?,
+        );
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .context("Failed to connect to MiniMax TTS WebSocket")?;
+
+        let mut audio = Vec::new();
+        let synth_result = async {
+            let connected = ws
+                .next()
+                .await
+                .context("MiniMax TTS WebSocket closed before connected_success")??;
+            let connected = match connected {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text)
+                    .context("Invalid MiniMax connected_success payload")?,
+                other => bail!("Unexpected MiniMax TTS frame before start: {other:?}"),
+            };
+            if connected.get("event").and_then(serde_json::Value::as_str)
+                != Some("connected_success")
+            {
+                let detail =
+                    Self::extract_status_msg(&connected).unwrap_or_else(|| connected.to_string());
+                bail!("MiniMax TTS connection failed: {detail}");
+            }
+
+            ws.send(Message::Text(
+                self.task_start_payload(voice).to_string().into(),
+            ))
+            .await
+            .context("Failed to send MiniMax TTS task_start")?;
+
+            loop {
+                let frame = ws
+                    .next()
+                    .await
+                    .context("MiniMax TTS WebSocket closed before task_started")??;
+                match frame {
+                    Message::Text(text) => {
+                        let payload = serde_json::from_str::<serde_json::Value>(&text)
+                            .context("Invalid MiniMax task_started payload")?;
+                        match payload.get("event").and_then(serde_json::Value::as_str) {
+                            Some("task_started") => break,
+                            Some("task_failed") => {
+                                let detail = Self::extract_status_msg(&payload)
+                                    .unwrap_or_else(|| payload.to_string());
+                                bail!("MiniMax TTS task_start failed: {detail}");
+                            }
+                            Some("connected_success") => continue,
+                            _ => {}
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload))
+                            .await
+                            .context("Failed to answer MiniMax TTS ping")?;
+                    }
+                    Message::Close(frame) => {
+                        bail!("MiniMax TTS WebSocket closed before task_started: {frame:?}");
+                    }
+                    _ => {}
+                }
+            }
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "event": "task_continue",
+                    "text": text,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .context("Failed to send MiniMax TTS task_continue")?;
+
+            loop {
+                let frame = ws
+                    .next()
+                    .await
+                    .context("MiniMax TTS WebSocket closed before synthesis completed")??;
+                match frame {
+                    Message::Text(text) => {
+                        let payload = serde_json::from_str::<serde_json::Value>(&text)
+                            .context("Invalid MiniMax streaming payload")?;
+                        if payload.get("event").and_then(serde_json::Value::as_str)
+                            == Some("task_failed")
+                        {
+                            let detail = Self::extract_status_msg(&payload)
+                                .unwrap_or_else(|| payload.to_string());
+                            bail!("MiniMax TTS synthesis failed: {detail}");
+                        }
+                        if let Some(hex_audio) = payload
+                            .get("data")
+                            .and_then(|data| data.get("audio"))
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.is_empty())
+                        {
+                            let chunk = hex::decode(hex_audio)
+                                .context("MiniMax TTS returned invalid hex audio")?;
+                            audio.extend_from_slice(&chunk);
+                        }
+                        if payload
+                            .get("is_final")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload))
+                            .await
+                            .context("Failed to answer MiniMax TTS ping")?;
+                    }
+                    Message::Close(frame) => {
+                        bail!("MiniMax TTS WebSocket closed during synthesis: {frame:?}");
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        let _ = ws
+            .send(Message::Text(
+                serde_json::json!({
+                    "event": "task_finish",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ws.close(None)).await;
+
+        synth_result?;
+
+        if audio.is_empty() {
+            bail!("MiniMax TTS returned no audio data");
+        }
+
+        Ok(audio)
+    }
+
+    fn supported_voices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn supported_formats(&self) -> Vec<String> {
+        ["mp3", "pcm", "flac"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
 // ── TtsManager ───────────────────────────────────────────────────
 
 /// Central manager for multi-provider TTS synthesis.
@@ -598,6 +882,17 @@ impl TtsManager {
             providers.insert("piper".to_string(), Box::new(provider));
         }
 
+        if let Some(ref minimax_cfg) = config.minimax {
+            match MiniMaxWsTtsProvider::new(minimax_cfg, &config.default_format) {
+                Ok(p) => {
+                    providers.insert("minimax".to_string(), Box::new(p));
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping MiniMax TTS provider: {e}");
+                }
+            }
+        }
+
         let max_text_length = if config.max_text_length == 0 {
             DEFAULT_MAX_TEXT_LENGTH
         } else {
@@ -639,6 +934,14 @@ impl TtsManager {
                 resolved_provider = "piper",
                 "TTS provider alias applied"
             );
+            return Some(key.as_str());
+        }
+
+        if matches!(
+            lowered.as_str(),
+            "minimax-ws" | "minimax-websocket" | "minimax-tts"
+        ) && let Some((key, _)) = self.providers.get_key_value("minimax")
+        {
             return Some(key.as_str());
         }
 
@@ -824,6 +1127,19 @@ mod tests {
     }
 
     #[test]
+    fn tts_manager_with_minimax_provider() {
+        let mut config = default_tts_config();
+        config.default_provider = "minimax".to_string();
+        config.minimax = Some(zeroclaw_config::schema::MiniMaxTtsConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.available_providers(), vec!["minimax"]);
+    }
+
+    #[test]
     fn resolve_provider_key_maps_kokoro_alias_to_piper() {
         let mut config = default_tts_config();
         config.default_provider = "kokoro".to_string();
@@ -832,6 +1148,18 @@ mod tests {
         });
         let manager = TtsManager::new(&config).unwrap();
         assert_eq!(manager.resolve_provider_key("kokoro"), Some("piper"));
+    }
+
+    #[test]
+    fn resolve_provider_key_maps_minimax_ws_alias_to_minimax() {
+        let mut config = default_tts_config();
+        config.default_provider = "minimax".to_string();
+        config.minimax = Some(zeroclaw_config::schema::MiniMaxTtsConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        });
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.resolve_provider_key("minimax-ws"), Some("minimax"));
     }
 
     #[test]
@@ -884,6 +1212,7 @@ mod tests {
         assert!(config.google.is_none());
         assert!(config.edge.is_none());
         assert!(config.piper.is_none());
+        assert!(config.minimax.is_none());
     }
 
     #[test]
@@ -892,5 +1221,118 @@ mod tests {
         config.max_text_length = 0;
         let manager = TtsManager::new(&config).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[test]
+    fn tts_manager_rejects_minimax_wav_streaming() {
+        let mut config = default_tts_config();
+        config.default_provider = "minimax".to_string();
+        config.default_format = "wav".to_string();
+        config.minimax = Some(zeroclaw_config::schema::MiniMaxTtsConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        assert!(manager.available_providers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn minimax_ws_provider_synthesizes_audio_from_mock_server() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "event": "connected_success",
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let task_start = ws.next().await.unwrap().unwrap();
+            let task_start = match task_start {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected task_start frame: {other:?}"),
+            };
+            assert_eq!(task_start["event"], "task_start");
+            assert_eq!(task_start["model"], "speech-2.8-turbo");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "event": "task_started",
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let task_continue = ws.next().await.unwrap().unwrap();
+            let task_continue = match task_continue {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected task_continue frame: {other:?}"),
+            };
+            assert_eq!(task_continue["event"], "task_continue");
+            assert_eq!(task_continue["text"], "hello from minimax ws");
+
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "data": {"audio": hex::encode(b"audio-one")},
+                    "is_final": false,
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "data": {"audio": hex::encode(b"audio-two")},
+                    "is_final": true,
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let finish = ws.next().await.unwrap().unwrap();
+            let finish = match finish {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected task_finish frame: {other:?}"),
+            };
+            assert_eq!(finish["event"], "task_finish");
+        });
+
+        let provider = MiniMaxWsTtsProvider::new(
+            &zeroclaw_config::schema::MiniMaxTtsConfig {
+                api_key: Some("test-key".into()),
+                websocket_url: format!("ws://{addr}"),
+                ..Default::default()
+            },
+            "mp3",
+        )
+        .unwrap();
+
+        let audio = provider
+            .synthesize("hello from minimax ws", "male-qn-qingse")
+            .await
+            .unwrap();
+        assert_eq!(audio, b"audio-oneaudio-two");
+
+        server.await.unwrap();
     }
 }
