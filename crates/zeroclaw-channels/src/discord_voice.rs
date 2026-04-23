@@ -28,6 +28,9 @@ const VOICE_TICK_MS: u64 = 20;
 const DEFAULT_READY_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLAYBACK_SETTLE_MS: u64 = 250;
 const DEFAULT_JOIN_RETRY_MS: u64 = 5_000;
+const DEFAULT_TRANSCRIPT_COALESCE_MS: u64 = 2_000;
+const FAST_TRANSCRIPT_COALESCE_MS: u64 = 250;
+const FAST_TRANSCRIPT_FLUSH_CHARS: usize = 96;
 const TARGET_TTS_SAMPLE_RATE: u32 = 48_000;
 const TARGET_TTS_CHANNELS: u16 = 2;
 const VOICE_TICK_SAMPLE_RATE: u32 = 48_000;
@@ -77,6 +80,15 @@ enum VoiceBridgeCommand {
     JoinReady {
         call: Arc<tokio::sync::Mutex<songbird::Call>>,
     },
+    TranscriptionReady {
+        user_id: u64,
+        reply_target: String,
+        text: String,
+    },
+    FlushPendingTranscript {
+        user_id: u64,
+        generation: u64,
+    },
     PlayText {
         text: String,
         ack: oneshot::Sender<std::result::Result<std::time::Duration, String>>,
@@ -88,6 +100,13 @@ struct UserBuffer {
     samples: Vec<f32>,
     active_ticks: u32,
     silence_ticks: u32,
+}
+
+#[derive(Debug, Default)]
+struct PendingTranscript {
+    generation: u64,
+    reply_target: String,
+    text: String,
 }
 
 impl UserBuffer {
@@ -356,13 +375,14 @@ async fn run_voice_bridge(
         }
     });
 
-    let worker_result = voice_bridge_worker(state.clone(), command_rx, tx).await;
+    let worker_result = voice_bridge_worker(state.clone(), command_tx, command_rx, tx).await;
     client_task.abort();
     worker_result
 }
 
 async fn voice_bridge_worker(
     state: Arc<DiscordVoiceBridgeState>,
+    command_tx: mpsc::UnboundedSender<VoiceBridgeCommand>,
     mut command_rx: mpsc::UnboundedReceiver<VoiceBridgeCommand>,
     tx: mpsc::Sender<ChannelMessage>,
 ) -> Result<()> {
@@ -375,6 +395,7 @@ async fn voice_bridge_worker(
         Arc::new(RwLock::new(None));
     let mut ssrc_to_user: HashMap<u32, u64> = HashMap::new();
     let mut user_buffers: HashMap<u64, UserBuffer> = HashMap::new();
+    let mut pending_transcripts: HashMap<u64, PendingTranscript> = HashMap::new();
 
     while let Some(command) = command_rx.recv().await {
         match command {
@@ -387,10 +408,48 @@ async fn voice_bridge_worker(
             VoiceBridgeCommand::UserLeft { user_id } => {
                 ssrc_to_user.retain(|_, mapped_user| *mapped_user != user_id);
                 user_buffers.remove(&user_id);
+                if let Some(pending) = pending_transcripts.remove(&user_id) {
+                    emit_pending_transcript(user_id, pending, &tx).await;
+                }
             }
             VoiceBridgeCommand::JoinReady { call } => {
                 *current_call.write().await = Some(call);
                 state.joined.store(true, Ordering::SeqCst);
+            }
+            VoiceBridgeCommand::TranscriptionReady {
+                user_id,
+                reply_target,
+                text,
+            } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let pending = pending_transcripts.entry(user_id).or_default();
+                pending.generation = pending.generation.wrapping_add(1);
+                pending.reply_target = reply_target;
+                append_transcript_fragment(&mut pending.text, trimmed);
+                let generation = pending.generation;
+                let flush_delay_ms = transcript_flush_delay_ms(&pending.text);
+                let flush_tx = command_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(flush_delay_ms)).await;
+                    let _ = flush_tx.send(VoiceBridgeCommand::FlushPendingTranscript {
+                        user_id,
+                        generation,
+                    });
+                });
+            }
+            VoiceBridgeCommand::FlushPendingTranscript { user_id, generation } => {
+                let should_flush = pending_transcripts
+                    .get(&user_id)
+                    .is_some_and(|pending| pending.generation == generation);
+                if should_flush
+                    && let Some(pending) = pending_transcripts.remove(&user_id)
+                {
+                    emit_pending_transcript(user_id, pending, &tx).await;
+                }
             }
             VoiceBridgeCommand::PlayText { text, ack } => {
                 let Some(call) = current_call.read().await.clone() else {
@@ -485,7 +544,7 @@ async fn voice_bridge_worker(
                 for (user_id, samples) in flushed {
                     let file = encode_wav_from_f32(&samples, 48_000, 2);
                     let transcription_manager = transcription_manager.clone();
-                    let tx = tx.clone();
+                    let command_tx = command_tx.clone();
                     let reply_target = format!(
                         "{VOICE_REPLY_TARGET_PREFIX}{}:{}",
                         state.guild_id, state.channel_id
@@ -505,25 +564,11 @@ async fn voice_bridge_worker(
                                     chars = trimmed.len(),
                                     "Discord voice bridge transcribed utterance"
                                 );
-                                let message = ChannelMessage {
-                                    id: format!(
-                                        "discord_voice_{}_{}",
-                                        user_id,
-                                        uuid::Uuid::new_v4()
-                                    ),
-                                    sender: user_id.to_string(),
+                                let _ = command_tx.send(VoiceBridgeCommand::TranscriptionReady {
+                                    user_id,
                                     reply_target,
-                                    content: trimmed.to_string(),
-                                    channel: "discord".to_string(),
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    thread_ts: None,
-                                    interruption_scope_id: None,
-                                    attachments: vec![],
-                                };
-                                let _ = tx.send(message).await;
+                                    text: trimmed.to_string(),
+                                });
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -733,6 +778,71 @@ fn should_flush_buffer(
     let silence_met = buffer.silence_ms() >= silence_ms;
     let max_duration_met = buffer.duration_ms() >= max_utterance_ms;
     !buffer.samples.is_empty() && min_duration_met && (silence_met || max_duration_met)
+}
+
+async fn emit_pending_transcript(
+    user_id: u64,
+    pending: PendingTranscript,
+    tx: &mpsc::Sender<ChannelMessage>,
+) {
+    let trimmed = pending.text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let message = ChannelMessage {
+        id: format!("discord_voice_{}_{}", user_id, uuid::Uuid::new_v4()),
+        sender: user_id.to_string(),
+        reply_target: pending.reply_target,
+        content: trimmed.to_string(),
+        channel: "discord".to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        thread_ts: None,
+        interruption_scope_id: None,
+        attachments: vec![],
+    };
+    let _ = tx.send(message).await;
+}
+
+fn append_transcript_fragment(accumulated: &mut String, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+    if accumulated.is_empty() {
+        accumulated.push_str(fragment);
+        return;
+    }
+    if !fragment_starts_with_punctuation(fragment) && !accumulated.ends_with(char::is_whitespace) {
+        accumulated.push(' ');
+    }
+    accumulated.push_str(fragment);
+}
+
+fn transcript_flush_delay_ms(text: &str) -> u64 {
+    if text.chars().count() >= FAST_TRANSCRIPT_FLUSH_CHARS || transcript_has_terminal_punctuation(text)
+    {
+        FAST_TRANSCRIPT_COALESCE_MS
+    } else {
+        DEFAULT_TRANSCRIPT_COALESCE_MS
+    }
+}
+
+fn transcript_has_terminal_punctuation(text: &str) -> bool {
+    text.trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？'))
+}
+
+fn fragment_starts_with_punctuation(fragment: &str) -> bool {
+    fragment
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：'))
 }
 
 fn wav_bytes_to_voice_ticks(bytes: &[u8]) -> Result<Vec<Vec<i16>>> {
@@ -1088,6 +1198,24 @@ mod tests {
         let ticks = wav_bytes_to_voice_ticks(&wav).unwrap();
         assert_eq!(ticks.len(), 50);
         assert!(ticks.iter().all(|chunk| chunk.len() == 1920));
+    }
+
+    #[test]
+    fn append_transcript_fragment_inserts_spacing() {
+        let mut combined = String::from("hello");
+        append_transcript_fragment(&mut combined, "world");
+        append_transcript_fragment(&mut combined, "!");
+        assert_eq!(combined, "hello world!");
+    }
+
+    #[test]
+    fn transcript_flush_delay_prefers_fast_path_for_long_or_punctuated_text() {
+        assert_eq!(transcript_flush_delay_ms("short fragment"), DEFAULT_TRANSCRIPT_COALESCE_MS);
+        assert_eq!(transcript_flush_delay_ms("done."), FAST_TRANSCRIPT_COALESCE_MS);
+        assert_eq!(
+            transcript_flush_delay_ms(&"x".repeat(FAST_TRANSCRIPT_FLUSH_CHARS)),
+            FAST_TRANSCRIPT_COALESCE_MS
+        );
     }
 
     #[tokio::test]
