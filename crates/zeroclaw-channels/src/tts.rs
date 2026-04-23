@@ -610,6 +610,45 @@ impl TtsManager {
             .await
     }
 
+    fn resolve_provider_key<'a>(&'a self, requested: &str) -> Option<&'a str> {
+        let trimmed = requested.trim();
+        if let Some((key, _)) = self.providers.get_key_value(trimmed) {
+            return Some(key.as_str());
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        if let Some((key, _)) = self.providers.get_key_value(lowered.as_str()) {
+            return Some(key.as_str());
+        }
+
+        // Compatibility alias: users frequently configure local Kokoro-style
+        // OpenAI-compatible endpoints via [tts.piper].
+        if matches!(lowered.as_str(), "kokoro" | "kokoro-local" | "local-kokoro")
+            && let Some((key, _)) = self.providers.get_key_value("piper")
+        {
+            tracing::warn!(
+                requested_provider = trimmed,
+                resolved_provider = "piper",
+                "TTS provider alias applied"
+            );
+            return Some(key.as_str());
+        }
+
+        // Last-resort resilience: if exactly one provider is configured, use it.
+        if self.providers.len() == 1
+            && let Some((key, _)) = self.providers.iter().next()
+        {
+            tracing::warn!(
+                requested_provider = trimmed,
+                resolved_provider = key,
+                "TTS provider not configured; using the only available provider"
+            );
+            return Some(key.as_str());
+        }
+
+        None
+    }
+
     /// Synthesize text using a specific provider and voice.
     pub async fn synthesize_with_provider(
         &self,
@@ -629,10 +668,17 @@ impl TtsManager {
             );
         }
 
-        let tts = self.providers.get(provider).ok_or_else(|| {
+        let provider_key = self.resolve_provider_key(provider).ok_or_else(|| {
             anyhow::anyhow!(
                 "TTS provider '{}' not configured (available: {})",
                 provider,
+                self.available_providers().join(", ")
+            )
+        })?;
+        let tts = self.providers.get(provider_key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Resolved TTS provider '{}' is unavailable (available: {})",
+                provider_key,
                 self.available_providers().join(", ")
             )
         })?;
@@ -752,6 +798,28 @@ mod tests {
 
         let manager = TtsManager::new(&config).unwrap();
         assert_eq!(manager.available_providers(), vec!["piper"]);
+    }
+
+    #[test]
+    fn resolve_provider_key_maps_kokoro_alias_to_piper() {
+        let mut config = default_tts_config();
+        config.default_provider = "kokoro".to_string();
+        config.piper = Some(zeroclaw_config::schema::PiperTtsConfig {
+            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
+        });
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.resolve_provider_key("kokoro"), Some("piper"));
+    }
+
+    #[test]
+    fn resolve_provider_key_falls_back_to_only_provider() {
+        let mut config = default_tts_config();
+        config.default_provider = "something-else".to_string();
+        config.piper = Some(zeroclaw_config::schema::PiperTtsConfig {
+            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
+        });
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.resolve_provider_key("missing"), Some("piper"));
     }
 
     #[tokio::test]

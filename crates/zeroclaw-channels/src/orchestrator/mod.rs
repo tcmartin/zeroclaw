@@ -3948,22 +3948,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .discord
                 .as_ref()
                 .context("Discord channel is not configured")?;
-            Ok(Arc::new(
-                DiscordChannel::new(
-                    dc.bot_token.clone(),
-                    dc.guild_id.clone(),
-                    dc.allowed_users.clone(),
-                    dc.listen_to_bots,
-                    dc.mention_only,
-                )
-                .with_streaming(
-                    dc.stream_mode,
-                    dc.draft_update_interval_ms,
-                    dc.multi_message_delay_ms,
-                )
-                .with_transcription(config.transcription.clone())
-                .with_stall_timeout(dc.stall_timeout_secs),
-            ))
+            Ok(Arc::new(build_discord_channel(config, dc)))
         }
         "slack" => {
             let sl = config
@@ -4305,6 +4290,28 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
     }
 }
 
+fn build_discord_channel(
+    config: &Config,
+    dc: &zeroclaw_config::schema::DiscordConfig,
+) -> DiscordChannel {
+    DiscordChannel::new(
+        dc.bot_token.clone(),
+        dc.guild_id.clone(),
+        dc.allowed_users.clone(),
+        dc.listen_to_bots,
+        dc.mention_only,
+    )
+    .with_streaming(
+        dc.stream_mode,
+        dc.draft_update_interval_ms,
+        dc.multi_message_delay_ms,
+    )
+    .with_proxy_url(dc.proxy_url.clone())
+    .with_transcription(config.transcription.clone())
+    .with_tts(config.tts.clone())
+    .with_stall_timeout(dc.stall_timeout_secs)
+}
+
 /// Send a one-off message to a configured channel.
 pub async fn send_channel_message(
     config: &Config,
@@ -4381,23 +4388,7 @@ fn collect_configured_channels(
         if dc.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "Discord",
-                channel: Arc::new(
-                    DiscordChannel::new(
-                        dc.bot_token.clone(),
-                        dc.guild_id.clone(),
-                        dc.allowed_users.clone(),
-                        dc.listen_to_bots,
-                        dc.mention_only,
-                    )
-                    .with_streaming(
-                        dc.stream_mode,
-                        dc.draft_update_interval_ms,
-                        dc.multi_message_delay_ms,
-                    )
-                    .with_proxy_url(dc.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
-                    .with_stall_timeout(dc.stall_timeout_secs),
-                ),
+                channel: Arc::new(build_discord_channel(config, dc)),
             });
         } else {
             tracing::info!("Discord channel configured but disabled (enabled = false)");
@@ -11558,6 +11549,87 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[test]
+    fn build_discord_channel_wires_tts_and_transcription() {
+        let mut config = Config::default();
+        config.tts = zeroclaw_config::schema::TtsConfig {
+            enabled: true,
+            default_provider: "piper".into(),
+            default_voice: "af_heart".into(),
+            default_format: "mp3".into(),
+            max_text_length: 4096,
+            openai: None,
+            elevenlabs: None,
+            google: None,
+            edge: None,
+            piper: Some(zeroclaw_config::schema::PiperTtsConfig {
+                api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
+            }),
+        };
+        config.transcription = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".into(),
+            api_key: None,
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".into(),
+            model: "whisper-large-v3-turbo".into(),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 600,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: "http://127.0.0.1:5010/v1/audio/transcriptions".into(),
+                bearer_token: Some("test-token".into()),
+                max_audio_bytes: 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: false,
+        };
+        let discord = zeroclaw_config::schema::DiscordConfig {
+            enabled: true,
+            bot_token: "test-token".into(),
+            guild_id: Some("guild".into()),
+            allowed_users: vec!["*".into()],
+            listen_to_bots: false,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            proxy_url: Some("http://127.0.0.1:8080".into()),
+            stream_mode: zeroclaw_config::schema::StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
+        };
+
+        let channel = build_discord_channel(&config, &discord);
+        assert!(channel.tts_enabled_for_tests());
+        assert!(channel.transcription_enabled_for_tests());
+    }
+
+    #[test]
+    fn build_discord_channel_skips_disabled_tts() {
+        let config = Config::default();
+        let discord = zeroclaw_config::schema::DiscordConfig {
+            enabled: true,
+            bot_token: "test-token".into(),
+            guild_id: None,
+            allowed_users: vec!["*".into()],
+            listen_to_bots: false,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            proxy_url: None,
+            stream_mode: zeroclaw_config::schema::StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
+        };
+
+        let channel = build_discord_channel(&config, &discord);
+        assert!(!channel.tts_enabled_for_tests());
+        assert!(!channel.transcription_enabled_for_tests());
     }
 
     #[cfg(feature = "channel-voice-call")]

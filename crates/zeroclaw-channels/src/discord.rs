@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
@@ -24,6 +24,10 @@ pub struct DiscordChannel {
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    /// Text-to-speech config for outgoing voice replies.
+    tts_config: Option<zeroclaw_config::schema::TtsConfig>,
+    /// Reply targets currently in voice-chat mode.
+    voice_chats: Mutex<HashSet<String>>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
     stream_mode: zeroclaw_config::schema::StreamMode,
     /// Minimum interval (ms) between draft message edits (Partial mode only).
@@ -58,6 +62,8 @@ impl DiscordChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            tts_config: None,
+            voice_chats: Mutex::new(HashSet::new()),
             stream_mode: zeroclaw_config::schema::StreamMode::Off,
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
@@ -109,6 +115,14 @@ impl DiscordChannel {
         self
     }
 
+    /// Configure text-to-speech for outgoing voice replies.
+    pub fn with_tts(mut self, config: zeroclaw_config::schema::TtsConfig) -> Self {
+        if config.enabled {
+            self.tts_config = Some(config);
+        }
+        self
+    }
+
     /// Set the stall-watchdog timeout (0 = disabled).
     pub fn with_stall_timeout(mut self, secs: u64) -> Self {
         self.stall_timeout_secs = secs;
@@ -133,6 +147,166 @@ impl DiscordChannel {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    fn normalize_tts_extension(default_format: &str) -> &'static str {
+        match default_format.trim().to_ascii_lowercase().as_str() {
+            "wav" => "wav",
+            "opus" => "opus",
+            "ogg" => "ogg",
+            _ => "mp3",
+        }
+    }
+
+    async fn maybe_send_voice_reply(&self, recipient: &str, text: &str) -> anyhow::Result<()> {
+        let Some(tts_config) = self.tts_config.as_ref() else {
+            tracing::debug!(
+                recipient,
+                "Discord: skipping voice reply because TTS config is disabled"
+            );
+            return Ok(());
+        };
+
+        // One-shot voice mode: consume the flag as we emit a single voice reply.
+        // Optional override for diagnostics/manual E2E verification.
+        let force_voice = env_truthy("ZEROCLAW_DISCORD_FORCE_VOICE_REPLY");
+        let should_send_voice = self.voice_chats.lock().remove(recipient);
+        if !should_send_voice && !force_voice {
+            tracing::debug!(
+                recipient,
+                "Discord: skipping voice reply because channel is not in voice-chat mode"
+            );
+            return Ok(());
+        }
+        if force_voice {
+            tracing::warn!(
+                recipient,
+                "Discord: ZEROCLAW_DISCORD_FORCE_VOICE_REPLY active; forcing audio reply"
+            );
+        }
+
+        let max_chars = if tts_config.max_text_length == 0 {
+            4096
+        } else {
+            tts_config.max_text_length
+        };
+        let Some(voice_text) = prepare_voice_reply_text(text, max_chars) else {
+            tracing::debug!(
+                recipient,
+                "Discord: skipping voice reply because reply text is empty after normalization"
+            );
+            return Ok(());
+        };
+
+        let tts_manager = crate::tts::TtsManager::new(tts_config)?;
+        let available_providers = tts_manager.available_providers();
+        let audio_bytes = tts_manager.synthesize(&voice_text).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Discord TTS synthesis failed (default_provider='{}', available=[{}]): {e}",
+                tts_config.default_provider,
+                available_providers.join(", ")
+            )
+        })?;
+        if audio_bytes.is_empty() {
+            anyhow::bail!("Discord TTS returned empty audio");
+        }
+
+        let ext = Self::normalize_tts_extension(&tts_config.default_format);
+        let tmp_path =
+            std::env::temp_dir().join(format!("zeroclaw-discord-voice-{}.{}", Uuid::new_v4(), ext));
+        tokio::fs::write(&tmp_path, audio_bytes).await?;
+
+        let client = self.http_client();
+        let send_result = send_discord_message_with_files(
+            &client,
+            &self.bot_token,
+            recipient,
+            "",
+            &[tmp_path.clone()],
+        )
+        .await;
+
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        send_result?;
+
+        tracing::info!("Discord: sent voice reply to {}", recipient);
+        Ok(())
+    }
+
+    fn update_voice_chat_mode(
+        &self,
+        channel_id: &str,
+        has_audio_attachment: bool,
+        clean_content: &str,
+    ) {
+        if channel_id.is_empty() {
+            return;
+        }
+
+        if has_audio_attachment && self.tts_config.is_some() {
+            self.voice_chats.lock().insert(channel_id.to_string());
+            tracing::info!(channel_id, "Discord: voice-chat mode enabled for channel");
+            return;
+        }
+
+        if has_audio_attachment && self.tts_config.is_none() {
+            tracing::warn!(
+                channel_id,
+                "Discord: voice input received but TTS is disabled/config missing; reply will be text-only"
+            );
+            return;
+        }
+
+        if !clean_content.is_empty() {
+            // Exit voice mode when user switches back to typed messages.
+            self.voice_chats.lock().remove(channel_id);
+            tracing::debug!(
+                channel_id,
+                "Discord: voice-chat mode disabled due to typed message"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tts_enabled_for_tests(&self) -> bool {
+        self.tts_config.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcription_enabled_for_tests(&self) -> bool {
+        self.transcription.is_some() && self.transcription_manager.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voice_chat_enabled_for_tests(&self, channel_id: &str) -> bool {
+        self.voice_chats.lock().contains(channel_id)
+    }
+}
+
+fn prepare_voice_reply_text(text: &str, max_chars: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if max_chars == 0 {
+        return Some(trimmed.to_string());
+    }
+
+    let char_count = trimmed.chars().count();
+    if char_count <= max_chars {
+        return Some(trimmed.to_string());
+    }
+
+    Some(trimmed.chars().take(max_chars).collect())
+}
+
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
     }
 }
 
@@ -200,6 +374,10 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
     false
 }
 
+fn is_discord_voice_marker_attachment(att: &serde_json::Value) -> bool {
+    att.get("duration_secs").is_some() || att.get("waveform").is_some()
+}
+
 /// Download and transcribe audio attachments from a Discord message.
 ///
 /// Returns transcribed text blocks for any audio attachments found.
@@ -215,12 +393,18 @@ async fn transcribe_discord_audio_attachments(
             .get("content_type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let name = att
+        let raw_name = att
             .get("filename")
             .and_then(|v| v.as_str())
             .unwrap_or("file");
+        let voice_marker = is_discord_voice_marker_attachment(att);
+        let name = if (raw_name.is_empty() || raw_name == "file") && voice_marker {
+            "voice-note.ogg"
+        } else {
+            raw_name
+        };
 
-        if !is_discord_audio_attachment(ct, name) {
+        if !is_discord_audio_attachment(ct, name) && !voice_marker {
             continue;
         }
 
@@ -755,8 +939,12 @@ fn normalize_incoming_content(
     content: &str,
     mention_only: bool,
     bot_user_id: &str,
+    has_attachments: bool,
 ) -> Option<String> {
     if content.is_empty() {
+        if has_attachments && !mention_only {
+            return Some(String::new());
+        }
         return None;
     }
 
@@ -773,6 +961,9 @@ fn normalize_incoming_content(
 
     let normalized = normalized.trim().to_string();
     if normalized.is_empty() {
+        if has_attachments {
+            return Some(String::new());
+        }
         return None;
     }
 
@@ -890,6 +1081,17 @@ impl Channel for DiscordChannel {
                 }
             }
 
+            let voice_text = if cleaned_content.trim().is_empty() {
+                content.as_str()
+            } else {
+                cleaned_content.as_str()
+            };
+            if let Err(e) = self
+                .maybe_send_voice_reply(&message.recipient, voice_text)
+                .await
+            {
+                tracing::warn!("Discord voice reply failed: {e}");
+            }
             return Ok(());
         }
 
@@ -915,6 +1117,18 @@ impl Channel for DiscordChannel {
             if i < chunks.len() - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
+        }
+
+        let voice_text = if cleaned_content.trim().is_empty() {
+            content.as_str()
+        } else {
+            cleaned_content.as_str()
+        };
+        if let Err(e) = self
+            .maybe_send_voice_reply(&message.recipient, voice_text)
+            .await
+        {
+            tracing::warn!("Discord voice reply failed: {e}");
         }
 
         Ok(())
@@ -1130,23 +1344,31 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // DMs carry no guild_id in the Discord gateway payload. They are
                     // inherently private and implicitly addressed to the bot, so bypass
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
-                    else {
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let Some(clean_content) = normalize_incoming_content(
+                        content,
+                        effective_mention_only,
+                        &bot_user_id,
+                        !atts.is_empty(),
+                    ) else {
                         continue;
                     };
 
                     let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
                         let client = self.http_client();
                         let mut text_parts = process_attachments(&atts, &client).await;
 
@@ -1170,19 +1392,35 @@ impl Channel for DiscordChannel {
 
                         text_parts
                     };
+                    let has_audio_attachment = atts.iter().any(|att| {
+                        let content_type = att
+                            .get("content_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let raw_filename = att
+                            .get("filename")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let voice_marker = is_discord_voice_marker_attachment(att);
+                        let filename = if (raw_filename.is_empty() || raw_filename == "file")
+                            && voice_marker
+                        {
+                            "voice-note.ogg"
+                        } else {
+                            raw_filename
+                        };
+                        is_discord_audio_attachment(content_type, filename) || voice_marker
+                    });
+                    self.update_voice_chat_mode(&channel_id, has_audio_attachment, &clean_content);
                     let final_content = if attachment_text.is_empty() {
                         clean_content
+                    } else if clean_content.is_empty() {
+                        format!("[Attachments]\n{attachment_text}")
                     } else {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
@@ -1516,6 +1754,9 @@ impl Channel for DiscordChannel {
                     }
                 }
             }
+            if let Err(e) = self.maybe_send_voice_reply(recipient, text).await {
+                tracing::warn!("Discord voice reply failed: {e}");
+            }
             return Ok(());
         }
 
@@ -1529,6 +1770,11 @@ impl Channel for DiscordChannel {
             classify_outgoing_attachments(&parsed_attachments);
         let content =
             with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let voice_text = if cleaned_content.trim().is_empty() {
+            content.as_str()
+        } else {
+            cleaned_content.as_str()
+        };
 
         let client = self.http_client();
 
@@ -1557,6 +1803,9 @@ impl Channel for DiscordChannel {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            if let Err(e) = self.maybe_send_voice_reply(recipient, voice_text).await {
+                tracing::warn!("Discord voice reply failed: {e}");
+            }
             return Ok(());
         }
 
@@ -1571,6 +1820,9 @@ impl Channel for DiscordChannel {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            if let Err(e) = self.maybe_send_voice_reply(recipient, voice_text).await {
+                tracing::warn!("Discord voice reply failed: {e}");
+            }
             return Ok(());
         }
 
@@ -1581,6 +1833,10 @@ impl Channel for DiscordChannel {
             tracing::warn!("Discord finalize_draft edit failed: {e}; falling back to delete+send");
             let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
             send_discord_message_json(&client, &self.bot_token, recipient, &content).await?;
+        }
+
+        if let Err(e) = self.maybe_send_voice_reply(recipient, voice_text).await {
+            tracing::warn!("Discord voice reply failed: {e}");
         }
 
         Ok(())
@@ -1752,6 +2008,116 @@ mod tests {
     }
 
     #[test]
+    fn prepare_voice_reply_text_trims_and_truncates() {
+        let text = "  hello world  ";
+        let prepared = prepare_voice_reply_text(text, 5);
+        assert_eq!(prepared.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn prepare_voice_reply_text_rejects_empty() {
+        let prepared = prepare_voice_reply_text("   ", 10);
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn discord_voice_marker_attachment_detected_by_waveform() {
+        let att = serde_json::json!({
+            "id": "1",
+            "waveform": "AAA=",
+            "duration_secs": 2.31
+        });
+        assert!(is_discord_voice_marker_attachment(&att));
+    }
+
+    #[test]
+    fn discord_audio_attachment_detected_by_content_type_or_extension() {
+        assert!(is_discord_audio_attachment("audio/ogg", "file"));
+        assert!(is_discord_audio_attachment("", "voice-note.ogg"));
+        assert!(!is_discord_audio_attachment("", "document.txt"));
+    }
+
+    #[test]
+    fn env_truthy_accepts_common_true_values() {
+        // SAFETY: tests run in-process; this test owns this env var name.
+        unsafe { std::env::set_var("ZEROCLAW_TEST_TRUTHY", "true") };
+        assert!(env_truthy("ZEROCLAW_TEST_TRUTHY"));
+        // SAFETY: tests run in-process; this test owns this env var name.
+        unsafe { std::env::set_var("ZEROCLAW_TEST_TRUTHY", "1") };
+        assert!(env_truthy("ZEROCLAW_TEST_TRUTHY"));
+        // SAFETY: tests run in-process; this test owns this env var name.
+        unsafe { std::env::set_var("ZEROCLAW_TEST_TRUTHY", "ON") };
+        assert!(env_truthy("ZEROCLAW_TEST_TRUTHY"));
+        // SAFETY: tests run in-process; this test owns this env var name.
+        unsafe { std::env::remove_var("ZEROCLAW_TEST_TRUTHY") };
+        assert!(!env_truthy("ZEROCLAW_TEST_TRUTHY"));
+    }
+
+    #[test]
+    fn normalize_tts_extension_defaults_to_mp3() {
+        assert_eq!(DiscordChannel::normalize_tts_extension(""), "mp3");
+        assert_eq!(DiscordChannel::normalize_tts_extension("weird"), "mp3");
+        assert_eq!(DiscordChannel::normalize_tts_extension("opus"), "opus");
+    }
+
+    #[test]
+    fn voice_chat_mode_enabled_for_audio_when_tts_is_configured() {
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false).with_tts(
+            zeroclaw_config::schema::TtsConfig {
+                enabled: true,
+                default_provider: "piper".into(),
+                default_voice: "af_heart".into(),
+                default_format: "mp3".into(),
+                max_text_length: 4096,
+                openai: None,
+                elevenlabs: None,
+                google: None,
+                edge: None,
+                piper: Some(zeroclaw_config::schema::PiperTtsConfig {
+                    api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
+                }),
+            },
+        );
+
+        channel.update_voice_chat_mode("chan", true, "");
+        assert!(channel.voice_chat_enabled_for_tests("chan"));
+    }
+
+    #[test]
+    fn voice_chat_mode_stays_disabled_without_tts() {
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false);
+
+        channel.update_voice_chat_mode("chan", true, "");
+        assert!(!channel.voice_chat_enabled_for_tests("chan"));
+    }
+
+    #[test]
+    fn voice_chat_mode_clears_on_typed_message() {
+        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false).with_tts(
+            zeroclaw_config::schema::TtsConfig {
+                enabled: true,
+                default_provider: "piper".into(),
+                default_voice: "af_heart".into(),
+                default_format: "mp3".into(),
+                max_text_length: 4096,
+                openai: None,
+                elevenlabs: None,
+                google: None,
+                edge: None,
+                piper: Some(zeroclaw_config::schema::PiperTtsConfig {
+                    api_url: "http://127.0.0.1:5020/v1/audio/speech".into(),
+                }),
+            },
+        );
+
+        channel.update_voice_chat_mode("chan", true, "");
+        assert!(channel.voice_chat_enabled_for_tests("chan"));
+
+        channel.update_voice_chat_mode("chan", false, "typed follow-up");
+        assert!(!channel.voice_chat_enabled_for_tests("chan"));
+    }
+
+    #[test]
     fn base64_decode_empty_string() {
         let decoded = base64_decode("");
         assert_eq!(decoded, Some(String::new()));
@@ -1778,20 +2144,32 @@ mod tests {
 
     #[test]
     fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
+        let cleaned = normalize_incoming_content("hello there", true, "12345", false);
         assert!(cleaned.is_none());
     }
 
     #[test]
     fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     #[test]
     fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345", false);
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_incoming_content_accepts_attachment_only_message() {
+        let cleaned = normalize_incoming_content("", false, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn normalize_incoming_content_accepts_mention_plus_attachment_only() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some(""));
     }
 
     // mention_only DM-bypass tests
@@ -1803,7 +2181,8 @@ mod tests {
         let mention_only = true;
         let is_dm = true;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned =
+            normalize_incoming_content("hello without mention", effective, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("hello without mention"));
     }
 
@@ -1814,7 +2193,8 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned =
+            normalize_incoming_content("hello without mention", effective, "12345", false);
         assert!(cleaned.is_none());
     }
 
@@ -1825,7 +2205,7 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
+        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
