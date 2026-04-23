@@ -6,9 +6,22 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+const VOICE_STREAM_MIN_SENTENCE_CHARS: usize = 24;
+const VOICE_STREAM_SOFT_BREAK_CHARS: usize = 72;
+
+enum VoiceReplyStreamCommand {
+    Speak(String),
+}
+
+struct VoiceReplyStreamSession {
+    streamed_len: usize,
+    tx: mpsc::UnboundedSender<VoiceReplyStreamCommand>,
+}
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -42,6 +55,8 @@ pub struct DiscordChannel {
     multi_message_sent_len: Mutex<HashMap<String, usize>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
+    /// Per-recipient voice streaming sessions for realtime Discord voice replies.
+    voice_streams: Mutex<HashMap<String, VoiceReplyStreamSession>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
 }
@@ -73,6 +88,7 @@ impl DiscordChannel {
             last_draft_edit: Mutex::new(HashMap::new()),
             multi_message_sent_len: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
+            voice_streams: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
         }
     }
@@ -196,6 +212,90 @@ impl DiscordChannel {
             "ogg" => "ogg",
             _ => "mp3",
         }
+    }
+
+    fn is_voice_bridge_target(&self, recipient: &str) -> bool {
+        self.voice_bridge
+            .as_ref()
+            .is_some_and(|bridge| recipient == bridge.configured_target())
+    }
+
+    fn ensure_voice_stream_session(
+        &self,
+        recipient: &str,
+    ) -> Option<mpsc::UnboundedSender<VoiceReplyStreamCommand>> {
+        if let Some(existing) = self
+            .voice_streams
+            .lock()
+            .get(recipient)
+            .map(|session| session.tx.clone())
+        {
+            return Some(existing);
+        }
+        let bridge = self.voice_bridge.clone()?;
+        let recipient = recipient.to_string();
+        let task_recipient = recipient.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel::<VoiceReplyStreamCommand>();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    VoiceReplyStreamCommand::Speak(text) => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        if let Err(err) = bridge.play_reply(&task_recipient, &text).await {
+                            tracing::warn!(
+                                recipient = task_recipient,
+                                "Discord voice streaming reply failed: {err}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        self.voice_streams.lock().insert(
+            recipient,
+            VoiceReplyStreamSession {
+                streamed_len: 0,
+                tx: tx.clone(),
+            },
+        );
+        Some(tx)
+    }
+
+    fn queue_streamed_voice_segments(
+        &self,
+        recipient: &str,
+        text: &str,
+        finalize: bool,
+    ) -> anyhow::Result<bool> {
+        if !self.is_voice_bridge_target(recipient) {
+            return Ok(false);
+        }
+
+        let sender = self
+            .ensure_voice_stream_session(recipient)
+            .ok_or_else(|| anyhow::anyhow!("Discord voice bridge is unavailable"))?;
+
+        let segments = {
+            let mut sessions = self.voice_streams.lock();
+            let session = sessions
+                .get_mut(recipient)
+                .ok_or_else(|| anyhow::anyhow!("Discord voice stream session was not created"))?;
+            drain_streamable_voice_segments(text, &mut session.streamed_len, finalize)
+        };
+
+        for segment in segments {
+            sender.send(VoiceReplyStreamCommand::Speak(segment)).map_err(|_| {
+                anyhow::anyhow!("Discord voice stream queue closed unexpectedly")
+            })?;
+        }
+
+        if finalize {
+            self.voice_streams.lock().remove(recipient);
+        }
+
+        Ok(true)
     }
 
     async fn maybe_send_voice_reply(&self, recipient: &str, text: &str) -> anyhow::Result<()> {
@@ -864,6 +964,61 @@ fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
         clamped -= 1;
     }
     clamped
+}
+
+fn drain_streamable_voice_segments(
+    accumulated_text: &str,
+    streamed_len: &mut usize,
+    finalize: bool,
+) -> Vec<String> {
+    let mut segments = Vec::new();
+    if accumulated_text.len() < *streamed_len {
+        *streamed_len = 0;
+    }
+    let mut cursor = clamp_to_char_boundary(accumulated_text, *streamed_len);
+    while let Some(boundary) = next_streamable_voice_boundary(accumulated_text, cursor) {
+        let segment = accumulated_text[cursor..boundary].trim();
+        if !segment.is_empty() {
+            segments.push(segment.to_string());
+        }
+        cursor = boundary;
+    }
+
+    if finalize {
+        let tail = accumulated_text[cursor..].trim();
+        if !tail.is_empty() {
+            segments.push(tail.to_string());
+        }
+        cursor = accumulated_text.len();
+    }
+
+    *streamed_len = cursor;
+    segments
+}
+
+fn next_streamable_voice_boundary(accumulated_text: &str, streamed_len: usize) -> Option<usize> {
+    let start = clamp_to_char_boundary(accumulated_text, streamed_len);
+    let pending = &accumulated_text[start..];
+    let mut char_count = 0usize;
+    let mut soft_boundary = None;
+
+    for (offset, ch) in pending.char_indices() {
+        char_count += 1;
+        let boundary = start + offset + ch.len_utf8();
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n')
+            && char_count >= VOICE_STREAM_MIN_SENTENCE_CHARS
+        {
+            return Some(boundary);
+        }
+        if matches!(ch, ',' | ';' | ':' | '，' | '；' | '：')
+            && char_count >= VOICE_STREAM_SOFT_BREAK_CHARS
+            && soft_boundary.is_none()
+        {
+            soft_boundary = Some(boundary);
+        }
+    }
+
+    soft_boundary
 }
 
 /// Split a message into multiple logical chunks at paragraph boundaries for
@@ -1600,6 +1755,15 @@ impl Channel for DiscordChannel {
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if self.is_voice_bridge_target(&message.recipient) {
+            if let Some(bridge) = self.voice_bridge.as_ref() {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                bridge.ensure_running(tx).await;
+            }
+            return Ok(self
+                .ensure_voice_stream_session(&message.recipient)
+                .map(|_| "discord_voice_stream".to_string()));
+        }
         use zeroclaw_config::schema::StreamMode;
         match self.stream_mode {
             StreamMode::Off => Ok(None),
@@ -1643,6 +1807,9 @@ impl Channel for DiscordChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        if self.queue_streamed_voice_segments(recipient, text, false)? {
+            return Ok(());
+        }
         use zeroclaw_config::schema::StreamMode;
         match self.stream_mode {
             StreamMode::Off => Ok(()),
@@ -1789,6 +1956,9 @@ impl Channel for DiscordChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        if self.queue_streamed_voice_segments(recipient, text, true)? {
+            return Ok(());
+        }
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
             // Flush remaining buffered text.
             let thread_ts = self
@@ -2408,6 +2578,42 @@ mod tests {
         assert_eq!(clamp_to_char_boundary(text, 3), 1);
         assert_eq!(clamp_to_char_boundary(text, 4), 4);
         assert_eq!(clamp_to_char_boundary(text, 10), text.len());
+    }
+
+    #[test]
+    fn drain_streamable_voice_segments_flushes_complete_sentences() {
+        let mut streamed_len = 0;
+        let segments = drain_streamable_voice_segments(
+            "This is the first streamed sentence. This second sentence is still pending",
+            &mut streamed_len,
+            false,
+        );
+        assert_eq!(segments, vec!["This is the first streamed sentence."]);
+        assert_eq!(streamed_len, "This is the first streamed sentence.".len());
+    }
+
+    #[test]
+    fn drain_streamable_voice_segments_falls_back_to_soft_breaks_for_long_clauses() {
+        let mut streamed_len = 0;
+        let text = "This clause keeps going for quite a while without terminal punctuation or any kind of final stop, but it does reach a useful pause for speech";
+        let segments = drain_streamable_voice_segments(text, &mut streamed_len, false);
+        assert_eq!(
+            segments,
+            vec!["This clause keeps going for quite a while without terminal punctuation or any kind of final stop,"]
+        );
+        assert_eq!(
+            streamed_len,
+            "This clause keeps going for quite a while without terminal punctuation or any kind of final stop,".len()
+        );
+    }
+
+    #[test]
+    fn drain_streamable_voice_segments_finalize_flushes_short_tail() {
+        let mut streamed_len = 0;
+        let text = "Short reply";
+        let segments = drain_streamable_voice_segments(text, &mut streamed_len, true);
+        assert_eq!(segments, vec!["Short reply"]);
+        assert_eq!(streamed_len, text.len());
     }
 
     #[test]
