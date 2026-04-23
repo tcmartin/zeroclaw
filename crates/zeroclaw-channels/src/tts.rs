@@ -41,13 +41,17 @@ pub struct OpenAiTtsProvider {
     api_key: String,
     model: String,
     speed: f64,
+    output_format: String,
     client: reqwest::Client,
 }
 
 impl OpenAiTtsProvider {
     /// Create a new OpenAI TTS provider from config, resolving the API key
     /// from config or `OPENAI_API_KEY` env var.
-    pub fn new(config: &zeroclaw_config::schema::OpenAiTtsConfig) -> Result<Self> {
+    pub fn new(
+        config: &zeroclaw_config::schema::OpenAiTtsConfig,
+        output_format: &str,
+    ) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -66,6 +70,7 @@ impl OpenAiTtsProvider {
             api_key,
             model: config.model.clone(),
             speed: config.speed,
+            output_format: output_format.trim().to_ascii_lowercase(),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -86,7 +91,7 @@ impl TtsProvider for OpenAiTtsProvider {
             "input": text,
             "voice": voice,
             "speed": self.speed,
-            "response_format": "opus",
+            "response_format": self.output_format,
         });
 
         let resp = self
@@ -458,17 +463,19 @@ impl TtsProvider for EdgeTtsProvider {
 pub struct PiperTtsProvider {
     client: reqwest::Client,
     api_url: String,
+    output_format: String,
 }
 
 impl PiperTtsProvider {
     /// Create a new Piper TTS provider pointing at the given API URL.
-    pub fn new(api_url: &str) -> Self {
+    pub fn new(api_url: &str, output_format: &str) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
                 .expect("Failed to build HTTP client for Piper TTS"),
             api_url: api_url.to_string(),
+            output_format: output_format.trim().to_ascii_lowercase(),
         }
     }
 }
@@ -484,6 +491,7 @@ impl TtsProvider for PiperTtsProvider {
             "model": "tts-1",
             "input": text,
             "voice": voice,
+            "response_format": self.output_format,
         });
 
         let resp = self
@@ -542,7 +550,7 @@ impl TtsManager {
         let mut providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
 
         if let Some(ref openai_cfg) = config.openai {
-            match OpenAiTtsProvider::new(openai_cfg) {
+            match OpenAiTtsProvider::new(openai_cfg, &config.default_format) {
                 Ok(p) => {
                     providers.insert("openai".to_string(), Box::new(p));
                 }
@@ -586,7 +594,7 @@ impl TtsManager {
         }
 
         if let Some(ref piper_cfg) = config.piper {
-            let provider = PiperTtsProvider::new(&piper_cfg.api_url);
+            let provider = PiperTtsProvider::new(&piper_cfg.api_url, &config.default_format);
             providers.insert("piper".to_string(), Box::new(provider));
         }
 
@@ -780,12 +788,27 @@ mod tests {
 
     #[test]
     fn piper_provider_creation() {
-        let provider = PiperTtsProvider::new("http://127.0.0.1:5000/v1/audio/speech");
+        let provider = PiperTtsProvider::new("http://127.0.0.1:5000/v1/audio/speech", "wav");
         assert_eq!(provider.name(), "piper");
         assert_eq!(provider.api_url, "http://127.0.0.1:5000/v1/audio/speech");
+        assert_eq!(provider.output_format, "wav");
         assert_eq!(provider.supported_formats(), vec!["mp3", "wav", "opus"]);
         // Piper voices depend on installed models; list is empty.
         assert!(provider.supported_voices().is_empty());
+    }
+
+    #[test]
+    fn openai_provider_creation_uses_requested_output_format() {
+        let provider = OpenAiTtsProvider::new(
+            &zeroclaw_config::schema::OpenAiTtsConfig {
+                api_key: Some("test-key".into()),
+                model: "tts-1".into(),
+                speed: 1.0,
+            },
+            "wav",
+        )
+        .unwrap();
+        assert_eq!(provider.output_format, "wav");
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct DiscordChannel {
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     /// Text-to-speech config for outgoing voice replies.
     tts_config: Option<zeroclaw_config::schema::TtsConfig>,
+    /// Optional realtime Discord voice-channel bridge.
+    voice_bridge: Option<crate::discord_voice::DiscordVoiceBridge>,
     /// Reply targets currently in voice-chat mode.
     voice_chats: Mutex<HashSet<String>>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
@@ -63,6 +65,7 @@ impl DiscordChannel {
             transcription: None,
             transcription_manager: None,
             tts_config: None,
+            voice_bridge: None,
             voice_chats: Mutex::new(HashSet::new()),
             stream_mode: zeroclaw_config::schema::StreamMode::Off,
             draft_update_interval_ms: 1000,
@@ -120,6 +123,43 @@ impl DiscordChannel {
         if config.enabled {
             self.tts_config = Some(config);
         }
+        self
+    }
+
+    /// Configure realtime Discord voice bridging for a single voice channel.
+    pub fn with_voice_bridge(
+        mut self,
+        voice: Option<zeroclaw_config::schema::DiscordVoiceConfig>,
+        transcription: zeroclaw_config::schema::TranscriptionConfig,
+        tts: zeroclaw_config::schema::TtsConfig,
+    ) -> Self {
+        let Some(voice) = voice else {
+            return self;
+        };
+        if !voice.enabled {
+            return self;
+        }
+        let Some(guild_id) = self.guild_id.clone() else {
+            tracing::warn!(
+                "Discord voice bridge requires channels.discord.guild_id; voice bridge disabled"
+            );
+            return self;
+        };
+        self.voice_bridge = crate::discord_voice::DiscordVoiceBridge::new(
+            self.bot_token.clone(),
+            guild_id,
+            voice.channel_id,
+            self.allowed_users.clone(),
+            tts,
+            transcription,
+        )
+        .map(|bridge| {
+            bridge.with_detection_window(
+                voice.silence_ms,
+                voice.min_utterance_ms,
+                voice.max_utterance_ms,
+            )
+        });
         self
     }
 
@@ -1017,6 +1057,15 @@ impl Channel for DiscordChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
+
+        if let Some(ref bridge) = self.voice_bridge
+            && bridge
+                .play_reply(&message.recipient, cleaned_content.trim())
+                .await?
+        {
+            return Ok(());
+        }
+
         let (mut local_files, remote_urls, unresolved_markers) =
             classify_outgoing_attachments(&parsed_attachments);
 
@@ -1136,6 +1185,14 @@ impl Channel for DiscordChannel {
 
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        if let Some(ref bridge) = self.voice_bridge {
+            bridge.ensure_running(tx.clone()).await;
+            tracing::info!(
+                details = %crate::discord_voice::voice_ready_log_json(&bridge.configured_target()),
+                "Discord voice bridge launch requested"
+            );
+        }
+
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL

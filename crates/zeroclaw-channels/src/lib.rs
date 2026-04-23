@@ -20,6 +20,8 @@ pub mod dingtalk;
 pub mod discord;
 #[cfg(feature = "channel-discord")]
 pub mod discord_history;
+#[cfg(feature = "channel-discord")]
+pub mod discord_voice;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
 #[cfg(feature = "channel-email")]

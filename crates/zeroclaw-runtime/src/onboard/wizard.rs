@@ -3934,6 +3934,7 @@ fn setup_channels(
                         .map(|d| d.multi_message_delay_ms)
                         .unwrap_or(800),
                     stall_timeout_secs: existing_dc.map(|d| d.stall_timeout_secs).unwrap_or(0),
+                    voice: existing_dc.and_then(|d| d.voice.clone()),
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -7945,6 +7946,7 @@ mod tests {
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
                 stall_timeout_secs: 0,
+                voice: None,
             }),
             matrix: Some(MatrixConfig {
                 enabled: true,

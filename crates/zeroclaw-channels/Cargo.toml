@@ -55,6 +55,8 @@ nanohtml2text = "0.2"
 rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "rustls_backend"], optional = true }
+songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "receive", "serenity", "rustls", "tungstenite"], optional = true }
 
 # WhatsApp Web (optional)
 wa-rs = { version = "0.2", optional = true, default-features = false }
@@ -86,7 +88,7 @@ channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode"]
 # Channels with no optional deps (cfg gate only)
-channel-discord = []
+channel-discord = ["dep:serenity", "dep:songbird"]
 channel-slack = []
 channel-signal = []
 channel-mattermost = []

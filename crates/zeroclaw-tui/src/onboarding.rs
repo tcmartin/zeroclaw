@@ -774,6 +774,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     draft_update_interval_ms: 1000,
                     multi_message_delay_ms: 800,
                     stall_timeout_secs: 0,
+                    voice: None,
                 });
             }
         }

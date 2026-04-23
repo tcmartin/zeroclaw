@@ -4309,6 +4309,11 @@ fn build_discord_channel(
     .with_proxy_url(dc.proxy_url.clone())
     .with_transcription(config.transcription.clone())
     .with_tts(config.tts.clone())
+    .with_voice_bridge(
+        dc.voice.clone(),
+        config.transcription.clone(),
+        config.tts.clone(),
+    )
     .with_stall_timeout(dc.stall_timeout_secs)
 }
 
@@ -11602,6 +11607,7 @@ This is an example JSON object for profile settings."#;
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            voice: None,
         };
 
         let channel = build_discord_channel(&config, &discord);
@@ -11625,6 +11631,7 @@ This is an example JSON object for profile settings."#;
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            voice: None,
         };
 
         let channel = build_discord_channel(&config, &discord);

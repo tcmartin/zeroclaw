@@ -6810,6 +6810,18 @@ fn default_multi_message_delay_ms() -> u64 {
     800
 }
 
+fn default_discord_voice_silence_ms() -> u64 {
+    1200
+}
+
+fn default_discord_voice_min_utterance_ms() -> u64 {
+    400
+}
+
+fn default_discord_voice_max_utterance_ms() -> u64 {
+    12_000
+}
+
 fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
@@ -6919,6 +6931,10 @@ pub struct DiscordConfig {
     /// and retry if no progress is made within this duration. 0 = disabled.
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Optional realtime voice-bridge configuration for a single Discord voice channel.
+    #[serde(default)]
+    #[nested]
+    pub voice: Option<DiscordVoiceConfig>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -6928,6 +6944,28 @@ impl ChannelConfig for DiscordConfig {
     fn desc() -> &'static str {
         "connect your bot"
     }
+}
+
+/// Discord realtime voice-bridge configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.discord.voice"]
+pub struct DiscordVoiceConfig {
+    /// Enable realtime Discord voice-channel bridging.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Discord voice channel ID for the bot to join on startup.
+    #[serde(default)]
+    pub channel_id: String,
+    /// Silence window before an utterance is flushed to transcription.
+    #[serde(default = "default_discord_voice_silence_ms")]
+    pub silence_ms: u64,
+    /// Minimum voiced audio duration before transcription is attempted.
+    #[serde(default = "default_discord_voice_min_utterance_ms")]
+    pub min_utterance_ms: u64,
+    /// Maximum voiced audio duration before the utterance is forced through STT.
+    #[serde(default = "default_discord_voice_max_utterance_ms")]
+    pub max_utterance_ms: u64,
 }
 
 /// Discord history channel — logs ALL messages to discord.db and forwards @mentions to the agent.
@@ -12623,6 +12661,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            voice: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12645,6 +12684,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            voice: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();

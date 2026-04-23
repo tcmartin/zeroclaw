@@ -235,6 +235,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            voice: None,
         };
 
         let lark = LarkConfig {
