@@ -1435,6 +1435,9 @@ async fn main() -> Result<()> {
                         .await
                     })
                 })),
+                in_flight_work_probe: Some(Box::new(|| {
+                    zeroclaw_channels::orchestrator::active_channel_message_count()
+                })),
             };
             Box::pin(daemon::run(config, host, port, subsystems)).await
         }

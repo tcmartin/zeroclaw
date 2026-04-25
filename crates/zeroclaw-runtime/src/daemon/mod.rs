@@ -7,6 +7,8 @@ use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const SHUTDOWN_DRAIN_POLL_MILLIS: u64 = 250;
+const SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 120;
 
 /// Wait for shutdown signal (SIGINT or SIGTERM).
 /// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
@@ -80,6 +82,55 @@ pub struct DaemonSubsystems {
                 + Sync,
         >,
     >,
+    /// Returns the count of in-flight user turns that should be allowed to
+    /// drain before the daemon aborts subsystem tasks on shutdown.
+    pub in_flight_work_probe: Option<Box<dyn Fn() -> usize + Send + Sync>>,
+}
+
+async fn wait_for_in_flight_work_to_drain(
+    probe: Option<&(dyn Fn() -> usize + Send + Sync)>,
+) -> bool {
+    let Some(probe) = probe else {
+        return true;
+    };
+
+    let started_at = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS);
+    let mut last_logged_count: Option<usize> = None;
+
+    loop {
+        let in_flight = probe();
+        if in_flight == 0 {
+            if started_at.elapsed() > Duration::ZERO {
+                tracing::info!(
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "In-flight work drained; continuing daemon shutdown"
+                );
+            }
+            return true;
+        }
+
+        if last_logged_count != Some(in_flight) {
+            tracing::warn!(
+                in_flight,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT_SECS,
+                "Waiting for in-flight work to finish before daemon shutdown"
+            );
+            last_logged_count = Some(in_flight);
+        }
+
+        if started_at.elapsed() >= timeout {
+            tracing::error!(
+                in_flight,
+                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT_SECS,
+                "Timed out draining in-flight work; forcing daemon shutdown"
+            );
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(SHUTDOWN_DRAIN_POLL_MILLIS)).await;
+    }
 }
 
 pub async fn run(
@@ -88,6 +139,12 @@ pub async fn run(
     port: u16,
     subsystems: DaemonSubsystems,
 ) -> Result<()> {
+    let DaemonSubsystems {
+        gateway_start,
+        channels_start,
+        mqtt_start,
+        in_flight_work_probe,
+    } = subsystems;
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -108,7 +165,7 @@ pub async fn run(
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
-    if let Some(gateway_start) = subsystems.gateway_start {
+    if let Some(gateway_start) = gateway_start {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
@@ -127,7 +184,7 @@ pub async fn run(
         ));
     }
 
-    if let Some(channels_start) = subsystems.channels_start {
+    if let Some(channels_start) = channels_start {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
@@ -151,7 +208,7 @@ pub async fn run(
     }
 
     // Wire up MQTT SOP listener if configured and enabled
-    if let Some(mqtt_start) = subsystems.mqtt_start {
+    if let Some(mqtt_start) = mqtt_start {
         if let Some(ref mqtt_config) = config.channels.mqtt {
             if mqtt_config.enabled {
                 let mqtt_cfg = mqtt_config.clone();
@@ -219,6 +276,7 @@ pub async fn run(
     // Wait for shutdown signal (SIGINT or SIGTERM)
     wait_for_shutdown_signal().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
+    wait_for_in_flight_work_to_drain(in_flight_work_probe.as_deref()).await;
 
     for handle in &handles {
         handle.abort();
@@ -1256,5 +1314,33 @@ mod tests {
             result.is_err(),
             "wait_for_shutdown_signal should not return after SIGHUP"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_returns_immediately_when_no_probe() {
+        assert!(wait_for_in_flight_work_to_drain(None).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_until_probe_reaches_zero() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let in_flight = Arc::new(AtomicUsize::new(2));
+        let probe_state = Arc::clone(&in_flight);
+        let updater_state = Arc::clone(&in_flight);
+        let probe = move || probe_state.load(Ordering::Relaxed);
+
+        let updater = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            updater_state.store(0, Ordering::Relaxed);
+        });
+
+        let drained = wait_for_in_flight_work_to_drain(Some(&probe)).await;
+        updater.await.unwrap();
+
+        assert!(drained);
     }
 }

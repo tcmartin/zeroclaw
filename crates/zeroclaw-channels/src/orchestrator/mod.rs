@@ -74,7 +74,7 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
-use portable_atomic::{AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, AtomicUsize, Ordering};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -204,8 +204,29 @@ const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
+static ACTIVE_CHANNEL_MESSAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+pub fn active_channel_message_count() -> usize {
+    ACTIVE_CHANNEL_MESSAGE_COUNT.load(Ordering::Relaxed)
+}
+
+struct ActiveChannelMessageGuard;
+
+impl ActiveChannelMessageGuard {
+    fn new() -> Self {
+        ACTIVE_CHANNEL_MESSAGE_COUNT.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveChannelMessageGuard {
+    fn drop(&mut self) {
+        ACTIVE_CHANNEL_MESSAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -3603,6 +3624,7 @@ async fn dispatch_worker(
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
     let register_in_flight = msg.channel != "cli";
+    let _active_message_guard = register_in_flight.then(ActiveChannelMessageGuard::new);
 
     if register_in_flight {
         let previous = {
@@ -12120,12 +12142,8 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn build_channel_system_prompt_adds_realtime_voice_guidance_for_discord_voice_targets() {
-        let prompt = build_channel_system_prompt(
-            "Base.",
-            "discord",
-            "discord_voice:1:2",
-            "user_aaa",
-        );
+        let prompt =
+            build_channel_system_prompt("Base.", "discord", "discord_voice:1:2", "user_aaa");
         assert!(prompt.contains("Realtime voice mode:"));
         assert!(prompt.contains("Prioritize low-latency spoken conversation."));
     }
