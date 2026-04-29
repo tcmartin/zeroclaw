@@ -194,6 +194,11 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 48_000;
+const INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO: f64 = 0.45;
+const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 8_000;
+const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 120_000;
+const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 4;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
 /// older turns are dropped before the request is sent to the provider,
@@ -201,6 +206,7 @@ const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// common context windows (128 k tokens ≈ 512 k chars) to leave room for
 /// system prompt, memory context, and model output.
 const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
+const INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 140_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -230,6 +236,52 @@ impl Drop for ActiveChannelMessageGuard {
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
+}
+
+fn is_interactive_channel(channel_name: &str) -> bool {
+    matches!(
+        channel_name,
+        "discord" | "telegram" | "slack" | "mattermost" | "matrix"
+    )
+}
+
+fn effective_channel_context_token_budget(channel_name: &str, configured: usize) -> usize {
+    if configured == 0 || !is_interactive_channel(channel_name) {
+        configured
+    } else {
+        configured.min(INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET)
+    }
+}
+
+fn effective_proactive_context_budget_chars(channel_name: &str) -> usize {
+    if is_interactive_channel(channel_name) {
+        INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS
+    } else {
+        PROACTIVE_CONTEXT_BUDGET_CHARS
+    }
+}
+
+fn effective_context_compression_config(
+    channel_name: &str,
+    mut config: zeroclaw_config::scattered_types::ContextCompressionConfig,
+) -> zeroclaw_config::scattered_types::ContextCompressionConfig {
+    if !is_interactive_channel(channel_name) {
+        return config;
+    }
+
+    config.threshold_ratio = config
+        .threshold_ratio
+        .min(INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO);
+    config.summary_max_chars = config
+        .summary_max_chars
+        .min(INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS);
+    config.source_max_chars = config
+        .source_max_chars
+        .min(INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS);
+    config.max_passes = config
+        .max_passes
+        .max(INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES);
+    config
 }
 
 fn effective_channel_max_tool_iterations(
@@ -2733,13 +2785,15 @@ async fn process_channel_message(
 
     // Proactively trim conversation history before sending to the provider
     // to prevent context-window-exceeded errors (bug #3460).
-    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
+    let proactive_context_budget_chars = effective_proactive_context_budget_chars(&msg.channel);
+    let dropped = proactive_trim_turns(&mut prior_turns, proactive_context_budget_chars);
     if dropped > 0 {
         tracing::info!(
             channel = %msg.channel,
             sender = %msg.sender,
             dropped_turns = dropped,
             remaining_turns = prior_turns.len(),
+            proactive_context_budget_chars,
             "Proactively trimmed conversation history to fit context budget"
         );
     }
@@ -2813,10 +2867,15 @@ async fn process_channel_message(
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
     {
-        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let context_token_budget =
+            effective_channel_context_token_budget(&msg.channel, ctx.context_token_budget);
+        let cc_config = effective_context_compression_config(
+            &msg.channel,
+            ctx.prompt_config.agent.context_compression.clone(),
+        );
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
-            ctx.context_token_budget,
+            context_token_budget,
         )
         .with_memory(Arc::clone(&ctx.memory));
         match compressor
@@ -2827,6 +2886,7 @@ async fn process_channel_message(
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
+                    context_token_budget,
                     tokens_before = result.tokens_before,
                     tokens_after = result.tokens_after,
                     passes = result.passes_used,
@@ -5816,6 +5876,51 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn effective_channel_context_token_budget_tightens_interactive_channels() {
+        assert_eq!(
+            effective_channel_context_token_budget("discord", 180_000),
+            INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET
+        );
+        assert_eq!(
+            effective_channel_context_token_budget("telegram", 32_000),
+            32_000
+        );
+        assert_eq!(
+            effective_channel_context_token_budget("email", 180_000),
+            180_000
+        );
+        assert_eq!(effective_channel_context_token_budget("discord", 0), 0);
+    }
+
+    #[test]
+    fn effective_context_compression_config_tightens_interactive_channels() {
+        let config = zeroclaw_config::scattered_types::ContextCompressionConfig {
+            threshold_ratio: 0.9,
+            max_passes: 1,
+            summary_max_chars: 50_000,
+            source_max_chars: 2_000_000,
+            ..Default::default()
+        };
+        let tightened = effective_context_compression_config("discord", config);
+        assert_eq!(
+            tightened.threshold_ratio,
+            INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO
+        );
+        assert_eq!(
+            tightened.summary_max_chars,
+            INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS
+        );
+        assert_eq!(
+            tightened.source_max_chars,
+            INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS
+        );
+        assert_eq!(
+            tightened.max_passes,
+            INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES
+        );
     }
 
     #[test]
