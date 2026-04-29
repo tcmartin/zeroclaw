@@ -194,10 +194,10 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
-const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 48_000;
-const INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO: f64 = 0.45;
-const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 8_000;
-const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 120_000;
+const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 96_000;
+const INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO: f64 = 0.70;
+const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 16_000;
+const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 400_000;
 const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 4;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
@@ -206,7 +206,7 @@ const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 4;
 /// common context windows (128 k tokens ≈ 512 k chars) to leave room for
 /// system prompt, memory context, and model output.
 const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
-const INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 140_000;
+const INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 300_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
