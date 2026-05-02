@@ -790,6 +790,78 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+/// Parse explicit `to=<tool>` style tool calls from response text.
+///
+/// Handles malformed-but-intentional outputs like:
+/// - `to=memory_recall json\n{"query":"..."}`
+/// - `to=shell code={"command":"pwd"}`
+/// - chained calls like `to=file_read {...}to=shell {...}`
+///
+/// Some providers/models emit this older ZeroClaw-ish format with extra junk
+/// between the tool name and the JSON body. As long as we can reliably find the
+/// explicit `to=<tool>` marker and the following balanced JSON object, we
+/// recover the tool call instead of leaking it back to the user as chat text.
+fn parse_explicit_to_tool_calls(response: &str) -> Vec<(ParsedToolCall, String)> {
+    static TO_CALL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)to=([a-zA-Z_][a-zA-Z0-9_]*)").unwrap());
+
+    let mut calls = Vec::new();
+    let mut scan_from = 0usize;
+
+    while scan_from < response.len() {
+        let haystack = &response[scan_from..];
+        let Some(cap) = TO_CALL_RE.captures(haystack) else {
+            break;
+        };
+
+        let full = cap.get(0).expect("regex capture 0 exists");
+        let tool_name = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if tool_name.is_empty() {
+            scan_from += full.end();
+            continue;
+        }
+
+        let tool_name = map_tool_name_alias(tool_name).to_string();
+        let absolute_match_start = scan_from + full.start();
+        let search_start = scan_from + full.end();
+        let remainder = &response[search_start..];
+
+        let Some(brace_rel) = remainder.find('{') else {
+            scan_from = search_start;
+            continue;
+        };
+        let json_start = search_start + brace_rel;
+        let json_slice = &response[json_start..];
+        let Some(json_len) = find_json_end(json_slice) else {
+            scan_from = json_start + 1;
+            continue;
+        };
+
+        let json_end = json_start + json_len;
+        let json_text = &response[json_start..json_end];
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(json_text) else {
+            scan_from = json_start + 1;
+            continue;
+        };
+        if !arguments.is_object() {
+            scan_from = json_end;
+            continue;
+        }
+
+        calls.push((
+            ParsedToolCall {
+                name: tool_name,
+                arguments,
+                tool_call_id: None,
+            },
+            response[absolute_match_start..json_end].to_string(),
+        ));
+        scan_from = json_end;
+    }
+
+    calls
+}
+
 /// Return the canonical default parameter name for a tool.
 ///
 /// When a model emits a shortened call like `shell>uname -a` (without an
@@ -1365,6 +1437,22 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Explicit `to=<tool>` calls with JSON payloads.
+    if calls.is_empty() {
+        let explicit_to_calls = parse_explicit_to_tool_calls(remaining);
+        if !explicit_to_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for (call, raw) in explicit_to_calls {
+                calls.push(call);
+                cleaned_text = cleaned_text.replace(&raw, "");
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -1457,7 +1545,11 @@ pub fn detect_tool_call_parse_issue(
         || trimmed.contains("\"tool_calls\"")
         || trimmed.contains("TOOL_CALL")
         || trimmed.contains("[TOOL_CALL]")
-        || trimmed.contains("<FunctionCall>");
+        || trimmed.contains("<FunctionCall>")
+        || trimmed.contains("to=shell")
+        || trimmed.contains("to=file_")
+        || trimmed.contains("to=memory_")
+        || trimmed.contains("to=http_");
 
     if looks_like_tool_payload {
         Some("response resembled a tool-call payload but no valid tool call could be parsed".into())
@@ -2528,6 +2620,32 @@ Let me check the result."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "date");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_explicit_to_style_with_noise_before_json() {
+        let input =
+            "to=memory_recall atelyjson\n{\"query\":\"swipe-files pipeline status\"}";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(calls[0].arguments["query"], "swipe-files pipeline status");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_chained_explicit_to_style_calls() {
+        let input = concat!(
+            "to=file_read code={\"path\":\"/tmp/a.txt\"}",
+            "to=shell json\n{\"command\":\"pwd\"}"
+        );
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "/tmp/a.txt");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[1].arguments["command"], "pwd");
         assert!(text.is_empty());
     }
 
