@@ -28,6 +28,34 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     }
 }
 
+fn parse_shorthand_arguments_value(root: &serde_json::Value) -> serde_json::Value {
+    let Some(map) = root.as_object() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+
+    let mut arguments = serde_json::Map::new();
+    for (key, value) in map {
+        if matches!(
+            key.as_str(),
+            "arguments"
+                | "call_id"
+                | "function"
+                | "id"
+                | "name"
+                | "parameters"
+                | "tool"
+                | "tool_call_id"
+                | "tool_name"
+        ) {
+            continue;
+        }
+
+        arguments.insert(key.clone(), value.clone());
+    }
+
+    serde_json::Value::Object(arguments)
+}
+
 fn parse_tool_call_id(
     root: &serde_json::Value,
     function: Option<&serde_json::Value>,
@@ -92,6 +120,8 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -101,8 +131,10 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = match value.get("arguments").or_else(|| value.get("parameters")) {
+        Some(raw_arguments) => parse_arguments_value(Some(raw_arguments)),
+        None => parse_shorthand_arguments_value(value),
+    };
     Some(ParsedToolCall {
         name,
         arguments,
@@ -1693,6 +1725,33 @@ After text."#;
     }
 
     #[test]
+    fn parse_tool_call_value_handles_tool_command_shorthand() {
+        let call_json = serde_json::json!({
+            "tool": "shell",
+            "command": "printf ok"
+        });
+        let parsed = parse_tool_call_value(&call_json).expect("expected a parsed call");
+        assert_eq!(parsed.name, "shell");
+        assert_eq!(parsed.arguments["command"], serde_json::json!("printf ok"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_xml_tool_command_shorthand() {
+        let response = r#"<tool_call>
+{"tool":"shell","command":"printf ok"}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments["command"],
+            serde_json::json!("printf ok")
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_handles_markdown_json_inside_tool_call_tag() {
         let response = r#"<tool_call>
 ```json
@@ -2625,8 +2684,7 @@ Let me check the result."#;
 
     #[test]
     fn parse_tool_calls_handles_explicit_to_style_with_noise_before_json() {
-        let input =
-            "to=memory_recall atelyjson\n{\"query\":\"swipe-files pipeline status\"}";
+        let input = "to=memory_recall atelyjson\n{\"query\":\"swipe-files pipeline status\"}";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_recall");
