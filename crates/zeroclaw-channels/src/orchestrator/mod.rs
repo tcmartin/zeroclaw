@@ -194,11 +194,11 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
-const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 96_000;
+const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 48_000;
 const INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO: f64 = 0.70;
-const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 16_000;
-const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 400_000;
-const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 4;
+const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 8_000;
+const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 120_000;
+const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 2;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
 /// older turns are dropped before the request is sent to the provider,
@@ -206,7 +206,7 @@ const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 4;
 /// common context windows (128 k tokens ≈ 512 k chars) to leave room for
 /// system prompt, memory context, and model output.
 const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
-const INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 300_000;
+const INTERACTIVE_PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 96_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -282,6 +282,30 @@ fn effective_context_compression_config(
         .max_passes
         .max(INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES);
     config
+}
+
+fn is_lightweight_check_in(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_matches(|c: char| {
+            c.is_ascii_whitespace() || matches!(c, '?' | '!' | '.' | ',' | ':' | ';')
+        })
+        .to_ascii_lowercase();
+
+    matches!(
+        normalized.as_str(),
+        "hi" | "hey"
+            | "hello"
+            | "yo"
+            | "sup"
+            | "gm"
+            | "ping"
+            | "what's up"
+            | "whats up"
+            | "what up"
+            | "you there"
+            | "u there"
+    )
 }
 
 fn effective_channel_max_tool_iterations(
@@ -1224,38 +1248,82 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let compacted = {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return false;
+        let Some(turns) = histories.get_mut(sender_key) else {
+            return false;
+        };
+
+        if turns.is_empty() {
+            return false;
+        }
+
+        let keep_from = turns
+            .len()
+            .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+
+        for turn in &mut compacted {
+            if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
+                turn.content =
+                    truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+            }
+        }
+
+        if compacted.is_empty() {
+            turns.clear();
+            return false;
+        }
+
+        *turns = compacted.clone();
+        compacted
     };
 
-    if turns.is_empty() {
-        return false;
+    persist_sender_history(ctx, sender_key, &compacted);
+    true
+}
+
+fn persist_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str, turns: &[ChatMessage]) {
+    let Some(ref store) = ctx.session_store else {
+        return;
+    };
+
+    if let Err(e) = store.delete_session(sender_key) {
+        tracing::warn!("Failed to delete session before history compaction for {sender_key}: {e}");
+        return;
     }
 
-    let keep_from = turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
-
-    for turn in &mut compacted {
-        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+    for turn in turns {
+        if let Err(e) = store.append(sender_key, turn) {
+            tracing::warn!("Failed to persist compacted session turn for {sender_key}: {e}");
+            return;
         }
     }
+}
 
-    if compacted.is_empty() {
-        turns.clear();
-        return false;
+fn replace_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str, turns: &[ChatMessage]) {
+    {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.push(sender_key.to_string(), turns.to_vec());
     }
+    persist_sender_history(ctx, sender_key, turns);
+}
 
-    *turns = compacted;
-    true
+fn persistable_channel_history(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    normalize_cached_channel_turns(
+        history
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Proactively trim conversation turns so that the total estimated character
@@ -2741,6 +2809,8 @@ async fn process_channel_message(
             .unwrap_or_default()
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let lightweight_check_in =
+        is_interactive_channel(&msg.channel) && is_lightweight_check_in(&msg.content);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
@@ -2788,13 +2858,26 @@ async fn process_channel_message(
     let proactive_context_budget_chars = effective_proactive_context_budget_chars(&msg.channel);
     let dropped = proactive_trim_turns(&mut prior_turns, proactive_context_budget_chars);
     if dropped > 0 {
+        replace_sender_history(ctx.as_ref(), &history_key, &prior_turns);
         tracing::info!(
             channel = %msg.channel,
             sender = %msg.sender,
             dropped_turns = dropped,
             remaining_turns = prior_turns.len(),
             proactive_context_budget_chars,
-            "Proactively trimmed conversation history to fit context budget"
+            "Proactively trimmed and persisted conversation history to fit context budget"
+        );
+    }
+
+    if lightweight_check_in && prior_turns.len() > 1 {
+        if let Some(current_turn) = prior_turns.last().cloned() {
+            prior_turns.clear();
+            prior_turns.push(current_turn);
+        }
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            "Using current-turn-only context for lightweight check-in"
         );
     }
 
@@ -2883,6 +2966,8 @@ async fn process_channel_message(
             .await
         {
             Ok(result) if result.compressed => {
+                let persisted_turns = persistable_channel_history(&history);
+                replace_sender_history(ctx.as_ref(), &history_key, &persisted_turns);
                 tracing::info!(
                     channel = %msg.channel,
                     sender = %msg.sender,
@@ -2890,7 +2975,8 @@ async fn process_channel_message(
                     tokens_before = result.tokens_before,
                     tokens_after = result.tokens_after,
                     passes = result.passes_used,
-                    "Proactive context compression applied before LLM call"
+                    persisted_turns = persisted_turns.len(),
+                    "Proactive context compression applied and persisted before LLM call"
                 );
             }
             Err(e) => {
@@ -5893,6 +5979,17 @@ mod tests {
             180_000
         );
         assert_eq!(effective_channel_context_token_budget("discord", 0), 0);
+    }
+
+    #[test]
+    fn lightweight_check_in_detects_short_greetings_only() {
+        assert!(is_lightweight_check_in("sup?"));
+        assert!(is_lightweight_check_in(" Yo! "));
+        assert!(is_lightweight_check_in("what's up"));
+        assert!(!is_lightweight_check_in(
+            "how far have you gotten with this stuff?"
+        ));
+        assert!(!is_lightweight_check_in("transcribe this video"));
     }
 
     #[test]
