@@ -37,16 +37,19 @@ From the host:
 ./scripts/host-media-bridge/start.sh
 ```
 
-From inside the VM, use the helper before falling back to any in-VM Parakeet
-server:
+From inside the VM, use the helpers before falling back to any in-VM Parakeet
+or Kokoro/Piper server:
 
 ```bash
 ~/Projects/zeroclaw/scripts/host-media-bridge/transcribe-file.sh input.m4a transcript.txt
+~/Projects/zeroclaw/scripts/host-media-bridge/synthesize-speech.sh "hello from host kokoro" speech.wav
 ```
 
-The helper posts multipart audio to
+The transcription helper posts multipart audio to
 `http://192.168.64.1:5010/v1/audio/transcriptions`, writes both text and JSON
-outputs, and reports the backend used.
+outputs, and reports the backend used. The speech helper posts OpenAI-compatible
+JSON to `http://192.168.64.1:5010/v1/audio/speech`, writes audio bytes, and
+reports the backend from `X-Host-Media-Backend`.
 
 To install it as a host LaunchAgent:
 

@@ -1126,6 +1126,37 @@ mod tests {
         assert_eq!(manager.available_providers(), vec!["piper"]);
     }
 
+    #[tokio::test]
+    async fn piper_provider_posts_openai_compatible_speech_request() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let audio = b"RIFFfake-wave".to_vec();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "tts-1",
+                "input": "hello host",
+                "voice": "af_heart",
+                "response_format": "wav"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/wav")
+                    .insert_header("X-Host-Media-Backend", "kokoro")
+                    .set_body_bytes(audio.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = PiperTtsProvider::new(&format!("{}/v1/audio/speech", server.uri()), "wav");
+
+        let result = provider.synthesize("hello host", "af_heart").await.unwrap();
+        assert_eq!(result, audio);
+    }
+
     #[test]
     fn tts_manager_with_minimax_provider() {
         let mut config = default_tts_config();
