@@ -198,7 +198,7 @@ const INTERACTIVE_CHANNEL_CONTEXT_TOKEN_BUDGET: usize = 48_000;
 const INTERACTIVE_CHANNEL_CONTEXT_THRESHOLD_RATIO: f64 = 0.70;
 const INTERACTIVE_CHANNEL_SUMMARY_MAX_CHARS: usize = 8_000;
 const INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS: usize = 120_000;
-const INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES: u32 = 2;
+const INTERACTIVE_CHANNEL_MAX_COMPRESSION_PASSES: u32 = 1;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
 /// older turns are dropped before the request is sent to the provider,
@@ -280,7 +280,7 @@ fn effective_context_compression_config(
         .min(INTERACTIVE_CHANNEL_SOURCE_MAX_CHARS);
     config.max_passes = config
         .max_passes
-        .max(INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES);
+        .min(INTERACTIVE_CHANNEL_MAX_COMPRESSION_PASSES);
     config
 }
 
@@ -2956,33 +2956,50 @@ async fn process_channel_message(
             &msg.channel,
             ctx.prompt_config.agent.context_compression.clone(),
         );
-        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
-            cc_config,
-            context_token_budget,
-        )
-        .with_memory(Arc::clone(&ctx.memory));
-        match compressor
-            .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
-            .await
-        {
-            Ok(result) if result.compressed => {
-                let persisted_turns = persistable_channel_history(&history);
-                replace_sender_history(ctx.as_ref(), &history_key, &persisted_turns);
-                tracing::info!(
-                    channel = %msg.channel,
-                    sender = %msg.sender,
-                    context_token_budget,
-                    tokens_before = result.tokens_before,
-                    tokens_after = result.tokens_after,
-                    passes = result.passes_used,
-                    persisted_turns = persisted_turns.len(),
-                    "Proactive context compression applied and persisted before LLM call"
-                );
+        let persistable_history = persistable_channel_history(&history);
+        let conversation_tokens =
+            zeroclaw_runtime::agent::context_compressor::estimate_tokens(&persistable_history);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let conversation_threshold =
+            (context_token_budget as f64 * cc_config.threshold_ratio) as usize;
+
+        if is_interactive_channel(&msg.channel) && conversation_tokens <= conversation_threshold {
+            tracing::debug!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                conversation_tokens,
+                conversation_threshold,
+                "Skipping channel context compression; non-system conversation is within budget"
+            );
+        } else {
+            let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
+                cc_config,
+                context_token_budget,
+            )
+            .with_memory(Arc::clone(&ctx.memory));
+            match compressor
+                .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
+                .await
+            {
+                Ok(result) if result.compressed => {
+                    let persisted_turns = persistable_channel_history(&history);
+                    replace_sender_history(ctx.as_ref(), &history_key, &persisted_turns);
+                    tracing::info!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        context_token_budget,
+                        tokens_before = result.tokens_before,
+                        tokens_after = result.tokens_after,
+                        passes = result.passes_used,
+                        persisted_turns = persisted_turns.len(),
+                        "Proactive context compression applied and persisted before LLM call"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Context compression failed, proceeding without: {e}");
+                }
+                _ => {}
             }
-            Err(e) => {
-                tracing::warn!("Context compression failed, proceeding without: {e}");
-            }
-            _ => {}
         }
     }
 
@@ -6016,7 +6033,7 @@ mod tests {
         );
         assert_eq!(
             tightened.max_passes,
-            INTERACTIVE_CHANNEL_MIN_COMPRESSION_PASSES
+            INTERACTIVE_CHANNEL_MAX_COMPRESSION_PASSES
         );
     }
 
