@@ -4,6 +4,9 @@ use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -107,6 +110,19 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     out
 }
 
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let pgid = -(pid as libc::pid_t);
+    // Best-effort cleanup for shell grandchildren. The child itself is also
+    // kill_on_drop, but commands such as `curl | python` can otherwise survive.
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -114,7 +130,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command in the workspace directory. For audio/video transcription, prefer any workspace-documented transcription helper or configured transcription endpoint before hand-rolling long local model commands."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -188,8 +204,26 @@ impl Tool for ShellTool {
             }
         }
 
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.as_std_mut().process_group(0);
+
         let timeout_secs = self.timeout_secs;
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+        let child_pid = child.id();
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -229,13 +263,18 @@ impl Tool for ShellTool {
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {timeout_secs}s and was killed"
-                )),
-            }),
+            Err(_) => {
+                if let Some(pid) = child_pid {
+                    kill_process_group(pid);
+                }
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                })
+            }
         }
     }
 }

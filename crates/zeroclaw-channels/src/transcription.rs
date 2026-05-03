@@ -562,15 +562,16 @@ impl TranscriptionProvider for GoogleSttProvider {
 /// configurable — not constrained by the 25 MB cloud API cap.
 pub struct LocalWhisperProvider {
     url: String,
-    bearer_token: String,
+    bearer_token: Option<String>,
     max_audio_bytes: usize,
     timeout_secs: u64,
 }
 
 impl LocalWhisperProvider {
-    /// Build from config. Fails if `url` or `bearer_token` is empty, if `url`
-    /// is not a valid HTTP/HTTPS URL (scheme must be `http` or `https`), if
-    /// `max_audio_bytes` is zero, or if `timeout_secs` is zero.
+    /// Build from config. Fails if `url` is empty, if `url` is not a valid
+    /// HTTP/HTTPS URL (scheme must be `http` or `https`), if a provided
+    /// `bearer_token` is empty, if `max_audio_bytes` is zero, or if
+    /// `timeout_secs` is zero.
     pub fn from_config(config: &zeroclaw_config::schema::LocalWhisperConfig) -> Result<Self> {
         let url = config.url.trim().to_string();
         anyhow::ensure!(!url.is_empty(), "local_whisper: `url` must not be empty");
@@ -584,9 +585,9 @@ impl LocalWhisperProvider {
         );
 
         let bearer_token = match config.bearer_token.as_deref().map(str::trim) {
-            None => anyhow::bail!("local_whisper: `bearer_token` must be set"),
+            None => None,
             Some("") => anyhow::bail!("local_whisper: `bearer_token` must not be empty"),
-            Some(t) => t.to_string(),
+            Some(t) => Some(t.to_string()),
         };
 
         anyhow::ensure!(
@@ -635,11 +636,18 @@ impl TranscriptionProvider for LocalWhisperProvider {
             .file_name(normalized_name)
             .mime_str(mime)?;
 
-        let resp = client
+        let request = client
             .post(&self.url)
-            .bearer_auth(&self.bearer_token)
             .multipart(Form::new().part("file", file_part))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+
+        let request = if let Some(token) = &self.bearer_token {
+            request.bearer_auth(token)
+        } else {
+            request
+        };
+
+        let resp = request
             .send()
             .await
             .context("Failed to send audio to local Whisper endpoint")?;
@@ -800,16 +808,16 @@ pub async fn transcribe_audio(
     file_name: &str,
     config: &TranscriptionConfig,
 ) -> Result<String> {
-    // Validate audio before resolving credentials so that size/format errors
-    // are reported before missing-key errors (preserves original behavior).
-    validate_audio(&audio_data, file_name)?;
-
     match config.default_provider.as_str() {
         "groq" => {
+            // Validate audio before resolving credentials so that size/format errors
+            // are reported before missing-key errors (preserves original behavior).
+            validate_audio(&audio_data, file_name)?;
             let groq = GroqProvider::from_config(config)?;
             groq.transcribe(&audio_data, file_name).await
         }
         "openai" => {
+            validate_audio(&audio_data, file_name)?;
             let openai_cfg = config.openai.as_ref().context(
                 "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
             )?;
@@ -817,6 +825,7 @@ pub async fn transcribe_audio(
             openai.transcribe(&audio_data, file_name).await
         }
         "deepgram" => {
+            validate_audio(&audio_data, file_name)?;
             let deepgram_cfg = config.deepgram.as_ref().context(
                 "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
             )?;
@@ -824,6 +833,7 @@ pub async fn transcribe_audio(
             deepgram.transcribe(&audio_data, file_name).await
         }
         "assemblyai" => {
+            validate_audio(&audio_data, file_name)?;
             let assemblyai_cfg = config.assemblyai.as_ref().context(
                 "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
             )?;
@@ -831,11 +841,19 @@ pub async fn transcribe_audio(
             assemblyai.transcribe(&audio_data, file_name).await
         }
         "google" => {
+            validate_audio(&audio_data, file_name)?;
             let google_cfg = config.google.as_ref().context(
                 "Default transcription provider 'google' is not configured. Add [transcription.google]",
             )?;
             let google = GoogleSttProvider::from_config(google_cfg)?;
             google.transcribe(&audio_data, file_name).await
+        }
+        "local_whisper" => {
+            let local_cfg = config.local_whisper.as_ref().context(
+                "Default transcription provider 'local_whisper' is not configured. Add [transcription.local_whisper]",
+            )?;
+            let local = LocalWhisperProvider::from_config(local_cfg)?;
+            local.transcribe(&audio_data, file_name).await
         }
         other => bail!("Unsupported transcription provider '{other}'"),
     }
@@ -921,6 +939,37 @@ mod tests {
             err.to_string().contains("[transcription.openai].api_key"),
             "expected openai-specific missing-key error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_whisper_default_provider_uses_local_endpoint() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "host bridge text"
+            })))
+            .mount(&server)
+            .await;
+
+        let config = TranscriptionConfig {
+            default_provider: "local_whisper".to_string(),
+            local_whisper: Some(local_whisper_config(&format!(
+                "{}/v1/audio/transcriptions",
+                server.uri()
+            ))),
+            ..TranscriptionConfig::default()
+        };
+
+        let result = transcribe_audio(b"fake-audio".to_vec(), "voice.ogg", &config)
+            .await
+            .unwrap();
+        assert_eq!(result, "host bridge text");
     }
 
     #[test]
@@ -1188,14 +1237,11 @@ mod tests {
     }
 
     #[test]
-    fn local_whisper_rejects_missing_bearer_token() {
+    fn local_whisper_accepts_missing_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.bearer_token = None;
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
-        assert!(
-            err.to_string().contains("`bearer_token` must be set"),
-            "got: {err}"
-        );
+        LocalWhisperProvider::from_config(&cfg)
+            .expect("unauthenticated local endpoints should be accepted");
     }
 
     #[test]
@@ -1344,6 +1390,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "auth ok");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_omits_auth_header_without_bearer_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "no auth ok"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        cfg.bearer_token = None;
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+
+        let result = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "no auth ok");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "authorization header should be omitted"
+        );
     }
 
     #[tokio::test]

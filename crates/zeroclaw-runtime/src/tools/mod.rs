@@ -205,12 +205,20 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+/// Maximum wall-clock time for interactive shell tool calls.
+///
+/// Long-running installs/transcriptions should move into explicit background
+/// jobs or purpose-built tools. Channel turns must not occupy in-flight slots
+/// for hours when a subprocess or local service stalls.
+const MAX_INTERACTIVE_SHELL_TIMEOUT_SECS: u64 = 900;
+
 /// Resolve the effective shell timeout used by the runtime shell tool.
 ///
 /// Compatibility rules:
 /// - Always respect `[autonomy].shell_timeout_secs` (legacy and policy-backed).
 /// - If `[shell_tool].timeout_secs` is configured higher, use that value.
 /// - Never allow a zero-second timeout.
+/// - Clamp excessive values so channel-driven shell calls cannot hang for hours.
 fn resolve_shell_timeout_secs(
     security: &SecurityPolicy,
     shell_tool_timeout_secs: Option<u64>,
@@ -221,16 +229,7 @@ fn resolve_shell_timeout_secs(
         _ => autonomy_timeout,
     };
 
-    if matches!(
-        security.autonomy,
-        zeroclaw_config::policy::AutonomyLevel::Full
-    ) {
-        // In yolo/full-autonomy mode we avoid short shell cutoffs that
-        // break long installs/downloads launched from channels.
-        resolved.max(86_400)
-    } else {
-        resolved
-    }
+    resolved.min(MAX_INTERACTIVE_SHELL_TIMEOUT_SECS)
 }
 
 /// Create the default tool registry
@@ -1030,11 +1029,11 @@ mod tests {
     #[test]
     fn resolve_shell_timeout_prefers_autonomy_timeout() {
         let security = SecurityPolicy {
-            shell_timeout_secs: 3600,
+            shell_timeout_secs: 600,
             ..SecurityPolicy::default()
         };
-        assert_eq!(resolve_shell_timeout_secs(&security, None), 3600);
-        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 3600);
+        assert_eq!(resolve_shell_timeout_secs(&security, None), 600);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 600);
     }
 
     #[test]
@@ -1043,7 +1042,23 @@ mod tests {
             shell_timeout_secs: 120,
             ..SecurityPolicy::default()
         };
-        assert_eq!(resolve_shell_timeout_secs(&security, Some(3600)), 3600);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(600)), 600);
+    }
+
+    #[test]
+    fn resolve_shell_timeout_clamps_excessive_values() {
+        let security = SecurityPolicy {
+            shell_timeout_secs: 21_600,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            resolve_shell_timeout_secs(&security, None),
+            MAX_INTERACTIVE_SHELL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_shell_timeout_secs(&security, Some(21_600)),
+            MAX_INTERACTIVE_SHELL_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -1057,14 +1072,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_shell_timeout_is_extended_in_full_autonomy() {
+    fn resolve_shell_timeout_is_not_extended_in_full_autonomy() {
         let security = SecurityPolicy {
             autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
             shell_timeout_secs: 60,
             ..SecurityPolicy::default()
         };
-        assert_eq!(resolve_shell_timeout_secs(&security, None), 86_400);
-        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 86_400);
+        assert_eq!(resolve_shell_timeout_secs(&security, None), 60);
+        assert_eq!(resolve_shell_timeout_secs(&security, Some(120)), 120);
     }
 
     #[test]
