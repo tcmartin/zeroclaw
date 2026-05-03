@@ -305,6 +305,16 @@ fn is_lightweight_check_in(content: &str) -> bool {
             | "what up"
             | "you there"
             | "u there"
+            | "ok"
+            | "okay"
+            | "alright"
+            | "all right"
+            | "got it"
+            | "sounds good"
+            | "cool"
+            | "nice"
+            | "word"
+            | "bet"
     )
 }
 
@@ -3004,15 +3014,19 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let reply_intent = if lightweight_check_in {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -6003,6 +6017,9 @@ mod tests {
         assert!(is_lightweight_check_in("sup?"));
         assert!(is_lightweight_check_in(" Yo! "));
         assert!(is_lightweight_check_in("what's up"));
+        assert!(is_lightweight_check_in("Alright!"));
+        assert!(is_lightweight_check_in("ok"));
+        assert!(is_lightweight_check_in("sounds good."));
         assert!(!is_lightweight_check_in(
             "how far have you gotten with this stuff?"
         ));
